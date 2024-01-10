@@ -7,6 +7,7 @@ const BYTES: usize = BITS / 8;
 ///
 /// This is meant for use with `Vec<u8>` and `&mut [u8]`. Using this on an
 /// unbuffered I/O resource is a recipe for a bad time.
+#[derive(Debug)]
 pub struct BitStackWriter<'a, T: Write> {
     writer: &'a mut T,
     storage: usize,
@@ -25,22 +26,22 @@ impl<'a, T: Write> BitStackWriter<'a, T> {
         }
     }
 
-    // Flush `to_write` bytes of data to the writer. Safe only if `to_write` is
-    // less than or equal to usize::BITS/8.
+    // Flush `to_write` bits of data to the writer. Safe only if `to_write` is
+    // less than or equal to usize::BITS.
     fn flush(&mut self, to_write: usize) -> std::io::Result<()> {
-        debug_assert!(to_write <= BYTES);
+        debug_assert!(to_write <= BITS);
         // Flush existing bits. Most of the time, we're not actually flushing
         // bits at all, but this should produce less branch mis-predicts than if
         // we wrapped this in an if statement.
+        let to_write_bytes = (to_write + 7) / 8;
         let bytes = self.storage.to_le_bytes();
-        let bytes_write: &[u8] = unsafe { bytes.get_unchecked(0..to_write) };
+        let bytes_write: &[u8] = unsafe { bytes.get_unchecked(0..to_write_bytes) };
         let written = self.writer.write(bytes_write)?;
-        if written != to_write {
+        if written != to_write_bytes {
             return Err(std::io::ErrorKind::WriteZero.into());
         }
-        let write_bits = to_write * 8;
-        self.bits -= write_bits;
-        self.storage >>= write_bits;
+        self.bits -= to_write;
+        self.storage >>= to_write;
         Ok(())
     }
 
@@ -61,11 +62,10 @@ impl<'a, T: Write> BitStackWriter<'a, T> {
             bits
         );
 
-        // We write either the half the word, or 0. If we divide by HALF_BITS,
-        // we'll get the number of half-words. Multiply that up by the number of
-        // bytes a half-word and that's what we'll write.
-        // Note: these divides/multiplies should become bitshifts.
-        let to_write = (self.bits / HALF_BITS) * (HALF_BITS / 8);
+        // We write either the half the word, or 0. If we mask out the portion
+        // of the bit offset that indexes within a halfword, we'll just get a
+        // number of bits to write that's either a halfword's worth, or 0.
+        let to_write = self.bits & !(HALF_BITS - 1);
         self.flush(to_write)?;
 
         // OR in the bits and update the state
@@ -77,16 +77,18 @@ impl<'a, T: Write> BitStackWriter<'a, T> {
 
     /// Finish writing to the stack and return the number of bits written.
     pub fn finish(mut self) -> std::io::Result<usize> {
-        self.flush((self.bits + 7) / 8)?;
+        self.flush(self.bits)?;
         Ok(self.written)
     }
 }
 
 /// A tool for reading bits off a stack.
+#[derive(Clone, Debug)]
 pub struct BitStackReader<'a> {
     reader: &'a [u8],
     available: usize,
-    last_word: usize,
+    last0: usize,
+    last1: usize,
 }
 
 impl<'a> BitStackReader<'a> {
@@ -99,18 +101,31 @@ impl<'a> BitStackReader<'a> {
             "Total number of bytes should be exactly enough to contain the total number of bits"
         );
 
-        let halfword_offset = (total_bits / (BITS / 2)) * (BYTES / 2);
-        let word_offset = halfword_offset.saturating_sub(BYTES / 2);
-        let mut last_word = 0;
+        let mut word_offset = ((total_bits-1) / BITS) * BYTES;
+        let mut last0 = 0;
         for i in (0..BYTES).rev() {
             if let Some(val) = reader.get(word_offset + i) {
-                last_word = (last_word << 8) | (*val as usize);
+                last0 = (last0 << 8) | (*val as usize);
+            }
+        }
+
+        if word_offset + (BYTES/2) > reader.len() {
+            word_offset = word_offset.saturating_sub(BYTES/2);
+        }
+        else {
+            word_offset += BYTES/2;
+        }
+        let mut last1 = 0;
+        for i in (0..BYTES).rev() {
+            if let Some(val) = reader.get(word_offset + i) {
+                last1 = (last1 << 8) | (*val as usize);
             }
         }
         Self {
             reader,
             available: total_bits,
-            last_word,
+            last0,
+            last1
         }
     }
 
@@ -130,10 +145,11 @@ impl<'a> BitStackReader<'a> {
         let bit_offset = self.available & (BITS / 2 - 1);
 
         let word = if idx + BYTES > self.reader.len() {
-            if idx + (BYTES / 2) > self.reader.len() {
-                self.last_word >> (BITS / 2)
-            } else {
-                self.last_word
+            if (idx / (BYTES/2)) & 1 == 1 {
+                self.last1
+            }
+            else {
+                self.last0
             }
         } else {
             // SAFETY: the earlier check should ensure that this code doesn't
@@ -167,11 +183,13 @@ impl<'a> BitStackReader<'a> {
 }
 
 /// A tool for reading bits off a stream
+#[derive(Clone, Debug)]
 pub struct BitStreamReader<'a> {
     reader: &'a [u8],
     total_bits: usize,
-    last_word: usize,
     bits_read: usize,
+    last0: usize,
+    last1: usize,
 }
 
 impl<'a> BitStreamReader<'a> {
@@ -184,19 +202,32 @@ impl<'a> BitStreamReader<'a> {
             "Total number of bytes should be exactly enough to contain the total number of bits"
         );
 
-        let halfword_offset = (total_bits / (BITS / 2)) * (BYTES / 2);
-        let word_offset = halfword_offset.saturating_sub(BYTES / 2);
-        let mut last_word = 0;
+        let mut word_offset = ((total_bits-1) / BITS) * BYTES;
+        let mut last0 = 0;
         for i in (0..BYTES).rev() {
             if let Some(val) = reader.get(word_offset + i) {
-                last_word = (last_word << 8) | (*val as usize);
+                last0 = (last0 << 8) | (*val as usize);
+            }
+        }
+
+        if word_offset + (BYTES/2) > reader.len() {
+            word_offset = word_offset.saturating_sub(BYTES/2);
+        }
+        else {
+            word_offset += BYTES/2;
+        }
+        let mut last1 = 0;
+        for i in (0..BYTES).rev() {
+            if let Some(val) = reader.get(word_offset + i) {
+                last1 = (last1 << 8) | (*val as usize);
             }
         }
         Self {
             reader,
             total_bits,
             bits_read: 0,
-            last_word,
+            last0,
+            last1
         }
     }
 
@@ -215,10 +246,11 @@ impl<'a> BitStreamReader<'a> {
         let bit_offset = self.bits_read & (BITS / 2 - 1);
 
         let word = if idx + BYTES > self.reader.len() {
-            if idx + (BYTES / 2) > self.reader.len() {
-                self.last_word >> (BITS / 2)
-            } else {
-                self.last_word
+            if (idx / (BYTES/2)) & 1 == 1 {
+                self.last1
+            }
+            else {
+                self.last0
             }
         } else {
             // SAFETY: the earlier check should ensure that this code doesn't
@@ -251,5 +283,151 @@ impl<'a> BitStreamReader<'a> {
             return Err(std::io::ErrorKind::InvalidData.into());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rand::Rng;
+
+    use super::*;
+
+    fn encode(test_vec: &[(usize, usize)]) -> (Vec<u8>, usize) {
+        // Encode stage
+        let mut encoded = Vec::new();
+        let mut enc = BitStackWriter::new(&mut encoded);
+        let mut total_bits = 0;
+        for (val, bits) in test_vec {
+            total_bits += bits;
+            enc.write_bits(*val, *bits)
+                .expect("Should always be able to write to a Vec");
+        }
+        let written_bits = enc
+            .finish()
+            .expect("Should always be able to write to a Vec");
+        assert_eq!(
+            total_bits, written_bits,
+            "Writer didn't actually write as many bits as we told it to"
+        );
+        let total_bytes = (total_bits + 7) / 8;
+        assert_eq!(
+            encoded.len(),
+            total_bytes,
+            "Number of bytes in vec ({}) isn't as expected ({})",
+            encoded.len(),
+            total_bytes
+        );
+
+        if encoded.len() <= 64 {
+            println!("test_vec: {:?}", test_vec);
+            println!("encoded (hex): {:x?}", encoded);
+        }
+        (encoded, total_bits)
+    }
+
+    fn decode_stack(encoded: &[u8], total_bits: usize, test_vec: &[(usize, usize)]) {
+        // Decode as a stack
+        let mut dec = BitStackReader::new(encoded, total_bits);
+        for (val, bits) in test_vec.iter().rev() {
+            let read_val = dec
+                .read(*bits)
+                .expect("Bitstack: Should have been able to read bits");
+            assert_eq!(
+                read_val, *val,
+                "Bitstack: Expected to get 0x{}, got 0x{}",
+                val, read_val
+            );
+        }
+    }
+
+    fn decode_stream(encoded: &[u8], total_bits: usize, test_vec: &[(usize, usize)]) {
+        // Decode as a stream
+        let mut dec = BitStreamReader::new(encoded, total_bits);
+        for (val, bits) in test_vec {
+            let read_val = dec
+                .read(*bits)
+                .expect("Bitstream: Should have been able to read bits");
+            assert_eq!(
+                read_val, *val,
+                "Bitstream: Expected to get 0x{}, got 0x{}",
+                val, read_val
+            );
+        }
+    }
+
+    #[test]
+    fn stack_tests() {
+        let mut test_vec = Vec::new();
+        for i in 0..(BITS * 5) {
+            test_vec.push((i & 0x1, 1));
+            let (encoded, total_bits) = encode(&test_vec);
+            decode_stack(&encoded, total_bits, &test_vec);
+        }
+
+        // Repeat a few more times with random bits
+        let mut rng = rand::thread_rng();
+        let dist = rand::distributions::Standard;
+        for _ in 0..10 {
+            test_vec.clear();
+            for _ in 0..(BITS*5) {
+                let v: bool = rng.sample(dist);
+                test_vec.push((v as usize, 1));
+                let (encoded, total_bits) = encode(&test_vec);
+                decode_stack(&encoded, total_bits, &test_vec);
+            }
+        }
+
+        // Repeat again, this time with random numbers of bits
+        let dist_val = rand::distributions::Standard;
+        let dist_bits = rand::distributions::Uniform::new_inclusive(1,16);
+        for _ in 0..10 {
+            test_vec.clear();
+            for _ in 0..100 {
+                let bits: usize = rng.sample(dist_bits);
+                let val: usize = rng.sample(dist_val);
+                let val = val & ((1<<bits)-1);
+                test_vec.push((val, bits));
+                let (encoded, total_bits) = encode(&test_vec);
+                decode_stack(&encoded, total_bits, &test_vec);
+            }
+        }
+    }
+
+    #[test]
+    fn stream_tests() {
+        let mut test_vec = Vec::new();
+        for i in 0..(BITS * 2) {
+            test_vec.push((i & 0x1, 1));
+            let (encoded, total_bits) = encode(&test_vec);
+            decode_stream(&encoded, total_bits, &test_vec);
+        }
+
+        // Repeat a few more times with random bits
+        let mut rng = rand::thread_rng();
+        let dist = rand::distributions::Standard;
+        for _ in 0..10 {
+            test_vec.clear();
+            for _ in 0..(BITS*5) {
+                let v: bool = rng.sample(dist);
+                test_vec.push((v as usize, 1));
+                let (encoded, total_bits) = encode(&test_vec);
+                decode_stream(&encoded, total_bits, &test_vec);
+            }
+        }
+
+        // Repeat again, this time with random numbers of bits
+        let dist_val = rand::distributions::Standard;
+        let dist_bits = rand::distributions::Uniform::new_inclusive(1,16);
+        for _ in 0..10 {
+            test_vec.clear();
+            for _ in 0..100 {
+                let bits: usize = rng.sample(dist_bits);
+                let val: usize = rng.sample(dist_val);
+                let val = val & ((1<<bits)-1);
+                test_vec.push((val, bits));
+                let (encoded, total_bits) = encode(&test_vec);
+                decode_stream(&encoded, total_bits, &test_vec);
+            }
+        }
     }
 }
