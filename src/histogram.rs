@@ -1,3 +1,11 @@
+use std::io::Write;
+use thiserror::Error;
+
+use crate::{
+    bitstream::{BitStackWriter, BitStreamReader},
+    TABLE_LOG_MAX, TABLE_LOG_MIN, TABLE_LOG_RANGE
+};
+
 /// A histogram of all the 8-bit symbols seen in a data sequence.
 #[derive(Clone, Debug)]
 pub struct Histogram {
@@ -77,11 +85,11 @@ impl Histogram {
         self.size
     }
 
-    /// Normalize the histogram. Panics if log2 is not between 9 and 16.
+    /// Normalize the histogram. Panics if log2 is not between 5 and 15.
     pub fn normalize(self, log2: u32) -> NormHistogram {
         assert!(
-            (9..=16).contains(&log2),
-            "Histogram normalization: log2 must be between 9 & 16, but is {}",
+            TABLE_LOG_RANGE.contains(&log2),
+            "Histogram normalization: log2 must be between 5 & 15, but is {}",
             log2
         );
 
@@ -154,7 +162,7 @@ impl Histogram {
         let low_one = (self.size * 3) >> (log2 + 1);
         let mut table = [0i32; 256];
         let mut to_distribute = 1 << (log2 as i32);
-        let mut total = self.size as u32;
+        let mut total = self.size;
 
         // Begin by distributing the low-probability symbols
         for (&t, t_norm) in self
@@ -221,8 +229,7 @@ impl Histogram {
                 log2,
                 max_symbol: self.max_symbol,
             };
-        }
-        else if total == 0 {
+        } else if total == 0 {
             // If all values are pretty poor, just evenly spread the values across
             // the remainder
             while to_distribute != 0 {
@@ -237,10 +244,9 @@ impl Histogram {
                     }
                 }
             }
-        }
-        else {
+        } else {
             let v_step_log = 62 - log2;
-            let mid = (1 << (v_step_log-1)) - 1;
+            let mid = (1 << (v_step_log - 1)) - 1;
             let r_step = (((1 << v_step_log) * to_distribute) + mid) / total;
             let mut tmp_total = mid;
             for (&t, t_norm) in self
@@ -261,9 +267,6 @@ impl Histogram {
                     tmp_total = end;
                 }
             }
-
-
-
         }
 
         NormHistogram {
@@ -302,4 +305,179 @@ impl NormHistogram {
     pub fn max_symbol(&self) -> u8 {
         self.max_symbol
     }
+
+    pub fn write_bound(&self) -> usize {
+        let max_header_size = (((self.max_symbol as usize + 1) * (self.log2 as usize)) >> 3) + 3;
+        if self.max_symbol > 0 {
+            max_header_size
+        } else {
+            512
+        }
+    }
+
+    /// Append the normalized histogram to a byte vector.
+    ///
+    /// The write format follows that of `zstd`, repeated here for convenience.
+    /// First, the log2(size) value used to make the table is written as
+    /// `log2_size-5`, as a 4 bit number.  Next is the sequence of symbol
+    /// values, from symbol 0 to the last present one. The number of bits used
+    /// by each symbol value is variable, and depends on the running count of
+    /// all values encoded so far. Each value encoded is 1 plus the symbol count;
+    /// this is because "low-probability" symbols are stored as "-1" and thus we
+    /// need to offset the value by 1 to get a non-negative value for encoding.
+    /// When the sum of all symbol counts is equal to `size`, the table is done.
+    ///
+    /// When a count of zero (value of 1) is encoded, the next 2 bits are a
+    /// "repeat" marker, indicating that the next 0-3 symbols also have a count
+    /// of zero. If the repeat marker is set to 3, the next 2 bits are also a
+    /// repeat marker, and so on.
+    ///
+    /// Because we can only encode some number of bits, but the available range
+    /// for N bits is always a power of two, we use the "spare" space to encode
+    /// some values with 1 bit less than might otherwise be needed. Let
+    /// `threshold=ceil(log2(remaining_counts))` be true. Then the spare space
+    /// is `threshold-remaining_counts`, and that can be used to encode 0 to
+    /// `threshold-remaining_counts` with one less bit than the other possible.
+    /// Ripping from the `zstd` documentation, take an example where there are
+    /// 156 values left. That means values from 0-157 (inclusive) are possible,
+    /// and thus 255-157=98 values are free to use in an 8-bit field. The first
+    /// 98 values (0-97) use 7 bits, and values from 98-157 use 8 bits. This
+    /// creates the encoding scheme:
+    ///
+    /// | Value read | Value decoded | Number of bits used |
+    /// | --         | --            | --                  |
+    /// | 0 - 97     | 0 - 97        | 7                   |
+    /// | 98 - 127   | 98 - 127      | 8                   |
+    /// | 128 - 225  | 0 - 97        | 7                   |
+    /// | 226 - 255  | 128 - 157     | 8                   |
+    ///
+    pub fn write<T: Write>(&self, writer: &mut T) -> std::io::Result<usize> {
+        let mut writer = BitStackWriter::new(writer);
+
+        // Write out the table's log2 size
+        let write_size = self.log2 - TABLE_LOG_MIN;
+        writer.write_bits(write_size as usize, 4)?;
+
+        let mut threshold = 1 << self.log2;
+        let mut remaining = threshold + 1;
+        let mut zero_count = 0;
+        let mut num_bits = (self.log2 + 1) as usize;
+        for &s in self.table.iter().take(self.max_symbol() as usize + 1) {
+            if remaining <= 1 { break; }
+            if zero_count != 0 {
+                if s == 0 {
+                    zero_count += 1;
+                    continue;
+                }
+
+                // Write out some number of 2-bit "repeat" markers, used for
+                // indicating a run of zeros.
+                zero_count -= 1;
+                while zero_count >= 24 {
+                    writer.write_bits(0xFFFF, 16)?;
+                    zero_count -= 24;
+                }
+                while zero_count >= 3 {
+                    writer.write_bits(0x3, 2)?;
+                    zero_count -= 3;
+                }
+                writer.write_bits(zero_count, 2)?;
+            }
+            let max = (2 * threshold - 1) - remaining;
+            remaining -= s.abs(); // Subtract out the count from our remaining count
+            let mut count = s + 1;
+            if count >= threshold {
+                count += max;
+            }
+            let bits_to_write = num_bits - (count < max) as usize;
+            writer.write_bits(count as usize, bits_to_write)?;
+            zero_count = (count == 1) as usize;
+            if remaining < 1 {
+                panic!("Normalized histogram was incorrect somehow");
+            }
+            // Adjust downward to the minimum number of bits needed for encoding
+            // a remaining value.
+            while remaining < threshold {
+                num_bits -= 1;
+                threshold >>= 1;
+            }
+        }
+
+        writer.finish()
+    }
+
+    /// Read in a normalized histogram that has been written out with [`write`][Self::write].
+    pub fn read(slice: &[u8]) -> Result<&[u8], HistError> {
+        let mut reader = BitStreamReader::new(slice, slice.len()*8);
+        let log2 = reader.read(4)? as u32 + TABLE_LOG_MIN;
+        if log2 > TABLE_LOG_MAX {
+            return Err(HistError::TableLogTooLarge(log2));
+        }
+        let mut hist = Self {
+            log2,
+            table: [0; 256],
+            max_symbol: 255,
+        };
+        let mut symbol = 0;
+        let mut threshold = 1<<hist.log2;
+        let mut remaining = threshold + 1;
+        let mut read_bit_count = log2 as usize + 1;
+        let mut previous0 = false;
+
+        while remaining>1 && symbol < 256 {
+            // Read in the 2-bit zero-continuation marks
+            if previous0 {
+                while reader.peek(16).unwrap_or(0) == 0xFFFF {
+                    reader.advance_by(16)?;
+                    symbol += 24;
+                }
+                while reader.peek(2).unwrap_or(0) == 3 {
+                    reader.advance_by(2)?;
+                    symbol += 3;
+                }
+                symbol += reader.read(2)?;
+            }
+            if symbol >= 256 { break; }
+
+            let max = (2*threshold-1) - remaining;
+            let raw_value = reader.peek(read_bit_count).or_else(|_| reader.peek(read_bit_count-1))?;
+            let mut value;
+            if (raw_value & (threshold-1)) < max {
+                reader.advance_by(read_bit_count-1)?;
+                value = raw_value & (threshold-1);
+            }
+            else {
+                reader.advance_by(read_bit_count)?;
+                value = raw_value & (2*threshold-1);
+                if value >= threshold { value -= max };
+            }
+            let value = value as i32 - 1;
+            // Subtract out the retrieved count. Note: this will not ever
+            // overflow, as our decoding method ensures `value` is never more than `remaining-1`.
+            remaining -= value.unsigned_abs() as usize;
+            hist.table[symbol] = value;
+            symbol += 1;
+            previous0 = value == 0;
+            while remaining < threshold {
+                read_bit_count -= 1;
+                threshold >>= 1;
+            }
+        }
+
+        if remaining != 1 {
+            return Err(HistError::TooManySymbols)
+        }
+
+        Ok(reader.finish_byte())
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum HistError {
+    #[error("Table log2 size is {0}, higher than the accepted maximum")]
+    TableLogTooLarge(u32),
+    #[error("Histogram counts are spread across more than 256 symbols")]
+    TooManySymbols,
+    #[error("Read error")]
+    Io(#[from] std::io::Error),
 }

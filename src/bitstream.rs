@@ -129,20 +129,48 @@ impl<'a> BitStackReader<'a> {
         }
     }
 
-    /// Pop some bits off the buffer. `bits` must be greater than 0 and less
-    /// than or equal to usize::BITS/2. This is only checked in debug mode, as
-    /// this is expected to be part of a tight loop in regular code.
+    /// Pop some bits off the buffer.
+    ///
+    /// `bits` must be greater than 0 and less than or equal to usize::BITS/2.
+    /// This is only checked in debug mode, as this is expected to be part of a
+    /// tight loop in regular code.
     pub fn read(&mut self, bits: usize) -> std::io::Result<usize> {
+        let ret = self.peek(bits)?;
+        self.advance_by(bits)?;
+        Ok(ret)
+    }
+
+    /// Advance the buffer pointer by N bits.
+    ///
+    /// `bits` must be greater than 0 and less than or equal to usize::BITS/2.
+    /// This is only checked in debug mode, as this is expected to be part of a
+    /// tight loop in regular code.
+    pub fn advance_by(&mut self, bits: usize) -> std::io::Result<()> {
         debug_assert!(bits <= BITS / 2);
         debug_assert!(bits != 0);
         if self.available < bits {
             return Err(std::io::ErrorKind::UnexpectedEof.into());
         }
         self.available -= bits;
+        Ok(())
+    }
+
+    /// Peek at the next N bits in the buffer.
+    ///
+    /// `bits` must be greater than 0 and less than or equal to usize::BITS/2.
+    /// This is only checked in debug mode, as this is expected to be part of a
+    /// tight loop in regular code.
+    pub fn peek(&self, bits: usize) -> std::io::Result<usize> {
+        debug_assert!(bits <= BITS / 2);
+        debug_assert!(bits != 0);
+        if self.available < bits {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        let bit_ptr = self.available - bits;
 
         // Set up the halfword/bit indices.
-        let idx = (self.available / (BITS / 2)) * (BYTES / 2);
-        let bit_offset = self.available & (BITS / 2 - 1);
+        let idx = (bit_ptr / (BITS / 2)) * (BYTES / 2);
+        let bit_offset = bit_ptr & (BITS / 2 - 1);
 
         let word = if idx + BYTES > self.reader.len() {
             if (idx / (BYTES/2)) & 1 == 1 {
@@ -173,12 +201,11 @@ impl<'a> BitStackReader<'a> {
         self.available
     }
 
-    /// Finish reading. Returns a failure if there are still bits left to read.
-    pub fn finish(self) -> std::io::Result<()> {
-        if self.available > 0 {
-            return Err(std::io::ErrorKind::InvalidData.into());
-        }
-        Ok(())
+    /// Finish reading. Returns the remaining byte slice and how many bits are
+    /// left in it.
+    pub fn finish(self) -> (&'a [u8], usize) {
+        let bytes = (self.available+7) / 8;
+        (&self.reader[0..bytes], self.available)
     }
 }
 
@@ -231,10 +258,38 @@ impl<'a> BitStreamReader<'a> {
         }
     }
 
-    /// Pull some bits off the buffer. `bits` must be greater than 0 and less
-    /// than or equal to usize::BITS/2. This is only checked in debug mode, as
-    /// this is expected to be part of a tight loop in regular code.
+    /// Pull some bits off the buffer.
+    ///
+    /// `bits` must be greater than 0 and less than or equal to usize::BITS/2.
+    /// This is only checked in debug mode, as this is expected to be part of a
+    /// tight loop in regular code.
     pub fn read(&mut self, bits: usize) -> std::io::Result<usize> {
+        let ret = self.peek(bits)?;
+        self.advance_by(bits)?;
+        Ok(ret)
+    }
+
+    /// Advance the buffer pointer by N bits.
+    ///
+    /// `bits` must be greater than 0 and less than or equal to usize::BITS/2.
+    /// This is only checked in debug mode, as this is expected to be part of a
+    /// tight loop in regular code.
+    pub fn advance_by(&mut self, bits: usize) -> std::io::Result<()> {
+        debug_assert!(bits <= BITS / 2);
+        debug_assert!(bits != 0);
+        if self.bits_read + bits > self.total_bits {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        self.bits_read += bits;
+        Ok(())
+    }
+
+    /// Peek at bits in the buffer.
+    ///
+    /// `bits` must be greater than 0 and less than or equal to usize::BITS/2.
+    /// This is only checked in debug mode, as this is expected to be part of a
+    /// tight loop in regular code.
+    pub fn peek(&self, bits: usize) -> std::io::Result<usize> {
         debug_assert!(bits <= BITS / 2);
         debug_assert!(bits != 0);
         if self.bits_read + bits > self.total_bits {
@@ -264,9 +319,6 @@ impl<'a> BitStreamReader<'a> {
             usize::from_le_bytes(*bytes)
         };
 
-        // Update our offset
-        self.bits_read += bits;
-
         // Apply the bit offset and mask just the desired bits.
         let out = (word >> bit_offset) & ((1 << bits) - 1);
         Ok(out)
@@ -277,12 +329,20 @@ impl<'a> BitStreamReader<'a> {
         self.total_bits - self.bits_read
     }
 
-    /// Finish reading. Returns a failure if there are still bits left to read.
-    pub fn finish(self) -> std::io::Result<()> {
-        if self.total_bits != self.bits_read {
-            return Err(std::io::ErrorKind::InvalidData.into());
-        }
-        Ok(())
+    /// Finish reading. Returns the remaining bits as a slice, the number of
+    /// bits left in the slice, and the bit offset into the first byte.
+    pub fn finish(self) -> (&'a [u8], usize, usize) {
+        let remaining = self.total_bits - self.bits_read;
+        let byte = self.bits_read / 8;
+        let offset = self.bits_read % 8;
+        (&self.reader[byte..], remaining, offset)
+    }
+
+    /// Finish reading, completing the current byte and returning whatever bytes
+    /// are left.
+    pub fn finish_byte(self) -> &'a [u8] {
+        let byte = (self.bits_read + 7) / 8;
+        &self.reader[byte..]
     }
 }
 
@@ -338,6 +398,9 @@ mod tests {
                 val, read_val
             );
         }
+        let (encoded, bits_left) = dec.finish();
+        assert!(encoded.is_empty());
+        assert!(bits_left == 0);
     }
 
     fn decode_stream(encoded: &[u8], total_bits: usize, test_vec: &[(usize, usize)]) {
@@ -353,6 +416,10 @@ mod tests {
                 val, read_val
             );
         }
+        let (encoded, bits_left, offset) = dec.finish();
+        assert!(encoded.len() <= 1);
+        assert!(bits_left == 0);
+        assert!(offset <= 8);
     }
 
     #[test]
