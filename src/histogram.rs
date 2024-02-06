@@ -137,15 +137,6 @@ impl Histogram {
                 largest_prob = prob;
                 largest = i;
             }
-            if prob == 0 {
-                dbg!(&t);
-                dbg!(&prob);
-                dbg!(&step);
-                dbg!(&scale);
-                let init_prob = (t as u64 * step) >> scale;
-                dbg!(&init_prob);
-                panic!("We must not fill a probability of 0 when it's nonzero");
-            }
             *t_norm = prob;
             to_distribute -= prob;
         }
