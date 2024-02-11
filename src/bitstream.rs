@@ -38,6 +38,7 @@ impl<'a> BitStackWriter<'a> {
 
     #[inline]
     pub fn flush(&mut self) {
+        /*
         if self.ptr.align_offset(HALF_BYTES) != 0 {
             // We're not aligned yet, so now it's time to dump some bytes
             // We'll only write enough to bring us into alignment
@@ -67,6 +68,7 @@ impl<'a> BitStackWriter<'a> {
                 return;
             }
         }
+        */
         // SAFETY: A few separate unsafe things are happening here, because
         // we're directly manipulating raw pointers:
         // - We write to the Vec's pointer directly as an aligned write. This is
@@ -79,23 +81,28 @@ impl<'a> BitStackWriter<'a> {
         //   which is just as safe as it was when we did it in the `new`
         //   function.
         unsafe {
-            let inc = ((self.bits / HALF_BITS) != 0) as usize;
             self.raw_write();
-            self.storage >>= inc * HALF_BITS;
-            self.bits -= inc * HALF_BITS;
-            self.ptr = self.ptr.add(inc * HALF_BYTES);
-            // Handle a full buffer
-            if self.ptr.offset_from(self.end_ptr) == 0 {
-                self.writer
-                    .set_len(self.ptr.offset_from(self.writer.as_ptr()) as usize);
-                self.writer.reserve(self.writer.len() * 2);
-                let spare = self.writer.spare_capacity_mut().as_mut_ptr_range();
-                self.ptr = spare.start as *mut u8;
-                self.end_ptr = spare
-                    .end
-                    .offset(spare.end.align_offset(HALF_BYTES) as isize - (HALF_BYTES as isize))
-                    as *const u8;
-            }
+            let inc = self.bits / 8;
+            self.storage >>= inc * 8;
+            self.bits -= inc * 8;
+            self.ptr = self.ptr.add(inc);
+
+            //let inc = ((self.bits / HALF_BITS) != 0) as usize;
+            //self.storage >>= inc * HALF_BITS;
+            //self.bits -= inc * HALF_BITS;
+            //self.ptr = self.ptr.add(inc * HALF_BYTES);
+            //// Handle a full buffer
+            //if self.ptr.offset_from(self.end_ptr) == 0 {
+            //    self.writer
+            //        .set_len(self.ptr.offset_from(self.writer.as_ptr()) as usize);
+            //    self.writer.reserve(self.writer.len() * 2);
+            //    let spare = self.writer.spare_capacity_mut().as_mut_ptr_range();
+            //    self.ptr = spare.start as *mut u8;
+            //    self.end_ptr = spare
+            //        .end
+            //        .offset(spare.end.align_offset(HALF_BYTES) as isize - (HALF_BYTES as isize))
+            //        as *const u8;
+            //}
         }
     }
 
@@ -103,9 +110,12 @@ impl<'a> BitStackWriter<'a> {
     #[cfg(target_pointer_width = "64")]
     #[inline]
     unsafe fn raw_write(&mut self) {
+        //self.ptr
+        //    .cast::<u32>()
+        //    .write((self.storage.to_le() & 0xFFFF_FFFF) as u32);
         self.ptr
-            .cast::<u32>()
-            .write((self.storage.to_le() & 0xFFFF_FFFF) as u32);
+            .cast::<usize>()
+            .write(self.storage.to_le());
     }
 
     /// Directly write a halfword to the internal Vec

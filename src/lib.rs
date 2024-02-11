@@ -215,25 +215,45 @@ pub fn fse_compress2(src: &[u8], dst: &mut Vec<u8>) -> usize {
     let mut writer = BitStackWriter::new(dst);
     let hist = histogram::NormHistogram::new(src);
     let fse_table = FseTable::new(&hist);
-    let mut src_iter = src.chunks(2).rev();
+    let mut src_iter = src.chunks(4).rev();
     let first = src_iter.next().unwrap();
-    let (mut encode0, mut encode1) = if first.len() == 1 {
-        let next = src_iter.next().unwrap();
-        let mut encode0 = FseEncode::new_first_symbol(&fse_table, first[0]);
-        let encode1 = FseEncode::new_first_symbol(&fse_table, next[1]);
-        encode0.encode(&mut writer, next[0]);
-        (encode0, encode1)
-    } else {
-        let encode0 = FseEncode::new_first_symbol(&fse_table, first[0]);
-        let encode1 = FseEncode::new_first_symbol(&fse_table, first[1]);
-        (encode0, encode1)
+    let (mut encode0, mut encode1) = match first.len() {
+        1 => {
+            let next = src_iter.next().unwrap();
+            let mut encode0 = FseEncode::new_first_symbol(&fse_table, first[0]);
+            let mut encode1 = FseEncode::new_first_symbol(&fse_table, next[3]);
+            encode0.encode(&mut writer, next[2]);
+            encode1.encode(&mut writer, next[1]);
+            encode0.encode(&mut writer, next[0]);
+            (encode0, encode1)
+        },
+        2 => {
+            let encode1 = FseEncode::new_first_symbol(&fse_table, first[1]);
+            let encode0 = FseEncode::new_first_symbol(&fse_table, first[0]);
+            (encode0, encode1)
+        },
+        3 => {
+            let mut encode0 = FseEncode::new_first_symbol(&fse_table, first[2]);
+            let encode1 = FseEncode::new_first_symbol(&fse_table, first[1]);
+            encode0.encode(&mut writer, first[0]);
+            (encode0, encode1)
+        },
+        4 => {
+            let mut encode1 = FseEncode::new_first_symbol(&fse_table, first[3]);
+            let mut encode0 = FseEncode::new_first_symbol(&fse_table, first[2]);
+            encode1.encode(&mut writer, first[1]);
+            encode0.encode(&mut writer, first[0]);
+            (encode0, encode1)
+        },
+        _ => panic!("Should always be a chunk of 4"),
     };
 
     for n in src_iter {
         unsafe {
-          encode0.encode_raw(&mut writer, *n.get_unchecked(0));
-          if usize::BITS < 64 { writer.flush(); }
+          encode1.encode_raw(&mut writer, *n.get_unchecked(3));
+          encode0.encode_raw(&mut writer, *n.get_unchecked(2));
           encode1.encode_raw(&mut writer, *n.get_unchecked(1));
+          encode0.encode_raw(&mut writer, *n.get_unchecked(0));
           writer.flush();
         }
     }
