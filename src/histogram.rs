@@ -1,9 +1,8 @@
-use std::io::Write;
 use thiserror::Error;
 
 use crate::{
     bitstream::{BitStackWriter, BitStreamReader},
-    TABLE_LOG_MAX, TABLE_LOG_MIN, TABLE_LOG_RANGE,
+    TABLE_LOG_MAX, TABLE_LOG_MIN, TABLE_LOG_RANGE, TABLE_LOG_DEFAULT,
 };
 
 /// A histogram of all the 8-bit symbols seen in a data sequence.
@@ -270,6 +269,21 @@ impl Histogram {
             max_symbol: self.max_symbol,
         }
     }
+
+    /// Work out the optimal log2(size) to use for histogram normalization.
+    pub fn optimal_log2(&self) -> u32 {
+        // Minimum number of bits for safely encoding a distribution
+        let min_bits_src = (self.size).ilog2() + 1;
+        let min_bits_symbols = self.max_symbol.ilog2() + 2;
+        let min_bits = min_bits_src.min(min_bits_symbols);
+
+        // Maximum number of bits a distribution could reasonably benefit from
+        let max_bits = (self.size - 1).ilog2() - 2;
+
+        TABLE_LOG_DEFAULT
+            .clamp(min_bits, max_bits)
+            .clamp(TABLE_LOG_MIN, TABLE_LOG_MAX)
+    }
 }
 
 /// A normalized histogram. Uses the special value "-1" to indicate a
@@ -282,6 +296,14 @@ pub struct NormHistogram {
 }
 
 impl NormHistogram {
+    /// Create a new normalized histogram from a data source. Panics if data is
+    /// >= 4 GiB.
+    pub fn new(data: &[u8]) -> Self {
+        let hist = Histogram::new(data);
+        let log2 = hist.optimal_log2();
+        hist.normalize(log2)
+    }
+
     // Get the normalized table
     pub fn table(&self) -> &[i32; 256] {
         &self.table
@@ -316,7 +338,8 @@ impl NormHistogram {
         }
     }
 
-    /// Append the normalized histogram to a byte vector.
+    /// Append the normalized histogram to a byte vector, returning how many
+    /// bits were written.
     ///
     /// The write format follows that of `zstd`, repeated here for convenience.
     /// First, the log2(size) value used to make the table is written as
@@ -352,12 +375,12 @@ impl NormHistogram {
     /// | 128 - 225  | 0 - 97        | 7                   |
     /// | 226 - 255  | 128 - 157     | 8                   |
     ///
-    pub fn write<T: Write>(&self, writer: &mut T) -> std::io::Result<usize> {
+    pub fn write(&self, writer: &mut Vec<u8>) -> usize {
         let mut writer = BitStackWriter::new(writer);
 
         // Write out the table's log2 size
         let write_size = self.log2 - TABLE_LOG_MIN;
-        writer.write_bits(write_size as usize, 4)?;
+        writer.write_bits(write_size as usize, 4);
 
         let mut threshold = 1 << self.log2;
         let mut remaining = threshold + 1;
@@ -377,14 +400,14 @@ impl NormHistogram {
                 // indicating a run of zeros.
                 zero_count -= 1;
                 while zero_count >= 24 {
-                    writer.write_bits(0xFFFF, 16)?;
+                    writer.write_bits(0xFFFF, 16);
                     zero_count -= 24;
                 }
                 while zero_count >= 3 {
-                    writer.write_bits(0x3, 2)?;
+                    writer.write_bits(0x3, 2);
                     zero_count -= 3;
                 }
-                writer.write_bits(zero_count, 2)?;
+                writer.write_bits(zero_count, 2);
             }
             let max = (2 * threshold - 1) - remaining;
             remaining -= s.abs(); // Subtract out the count from our remaining count
@@ -393,7 +416,7 @@ impl NormHistogram {
                 count += max;
             }
             let bits_to_write = num_bits - (count < max) as usize;
-            writer.write_bits(count as usize, bits_to_write)?;
+            writer.write_bits(count as usize, bits_to_write);
             zero_count = (count == 1) as usize;
             if remaining < 1 {
                 panic!("Normalized histogram was incorrect somehow");
@@ -524,7 +547,7 @@ mod tests {
         }
 
         let mut enc = Vec::with_capacity(norm_hist.write_bound());
-        norm_hist.write(&mut enc).unwrap();
+        norm_hist.write(&mut enc);
         let (dec_hist, rem) = NormHistogram::read(&enc).unwrap();
         assert!(rem.len() <= 1);
         assert_eq!(norm_hist, dec_hist);
