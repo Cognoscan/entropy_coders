@@ -10,7 +10,7 @@ use crate::{
 pub struct Histogram {
     table: [u32; 256],
     size: u32,
-    max_symbol: u8,
+    table_len: usize,
 }
 
 impl Histogram {
@@ -49,24 +49,25 @@ impl Histogram {
             }
         }
 
-        let mut max_symbol = 0;
+        let mut table_len = 0;
         for (i, x) in table.iter().enumerate().rev() {
             if *x != 0 {
-                max_symbol = i as u8;
+                table_len = i;
                 break;
             }
         }
+        table_len += 1;
 
         Self {
             table,
             size: data.len() as u32,
-            max_symbol,
+            table_len,
         }
     }
 
     /// Iterate over the populated part of the symbol frequency table
     pub fn table_iter(&self) -> impl Iterator<Item = &u32> {
-        self.table.iter().take(self.max_symbol as usize + 1)
+        self.table.iter().take(self.table_len)
     }
 
     /// Get the symbol frequency table
@@ -79,9 +80,9 @@ impl Histogram {
         self.table.iter().map(|x| if *x == 0 { 1 } else { 0 }).sum()
     }
 
-    /// What the highest-numbered symbol seen was
-    pub fn max_symbol(&self) -> u8 {
-        self.max_symbol
+    /// The length of the histogram table (1 more than the maximum symbol seen)
+    pub fn table_len(&self) -> usize {
+        self.table_len
     }
 
     /// Get the number of symbols that were in the original data
@@ -115,7 +116,7 @@ impl Histogram {
                 return NormHistogram {
                     table,
                     log2,
-                    max_symbol: self.max_symbol,
+                    table_len: self.table_len,
                 };
             }
             if t == 0 {
@@ -150,7 +151,7 @@ impl Histogram {
         NormHistogram {
             table,
             log2,
-            max_symbol: self.max_symbol,
+            table_len: self.table_len,
         }
     }
 
@@ -184,7 +185,7 @@ impl Histogram {
             return NormHistogram {
                 table,
                 log2,
-                max_symbol: self.max_symbol,
+                table_len: self.table_len,
             };
         }
 
@@ -195,7 +196,7 @@ impl Histogram {
                 .table
                 .iter()
                 .zip(table.iter_mut())
-                .take(self.max_symbol as usize + 1)
+                .take(self.table_len)
             {
                 if *t_norm == UNASSIGNED && t <= low {
                     *t_norm = 1;
@@ -205,7 +206,7 @@ impl Histogram {
             }
         }
 
-        if ((1 << log2) - to_distribute) == (self.max_symbol as u32 + 1) {
+        if ((1 << log2) - to_distribute) == (self.table_len as u32) {
             // We marked every single probability evenly, which means this is
             // functionally incompressible data. Just find the max, hand out the
             // remaining points to it, and call it a day.
@@ -221,14 +222,14 @@ impl Histogram {
             return NormHistogram {
                 table,
                 log2,
-                max_symbol: self.max_symbol,
+                table_len: self.table_len,
             };
         } else if total == 0 {
             // If all values are pretty poor, just evenly spread the values across
             // the remainder
             while to_distribute != 0 {
                 // Repeat until we're out of numbers to distribute.
-                for t in table.iter_mut().take(self.max_symbol as usize + 1) {
+                for t in table.iter_mut().take(self.table_len) {
                     if *t > 0 {
                         *t += 1;
                         to_distribute -= 1;
@@ -247,7 +248,7 @@ impl Histogram {
                 .table
                 .iter()
                 .zip(table.iter_mut())
-                .take(self.max_symbol as usize + 1)
+                .take(self.table_len)
             {
                 if *t_norm == UNASSIGNED {
                     let end = tmp_total + (t as u64 * r_step);
@@ -266,7 +267,7 @@ impl Histogram {
         NormHistogram {
             table,
             log2,
-            max_symbol: self.max_symbol,
+            table_len: self.table_len,
         }
     }
 
@@ -274,7 +275,7 @@ impl Histogram {
     pub fn optimal_log2(&self) -> u32 {
         // Minimum number of bits for safely encoding a distribution
         let min_bits_src = (self.size).ilog2() + 1;
-        let min_bits_symbols = self.max_symbol.ilog2() + 2;
+        let min_bits_symbols = self.table_len.ilog2() + 2;
         let min_bits = min_bits_src.min(min_bits_symbols);
 
         // Maximum number of bits a distribution could reasonably benefit from
@@ -292,7 +293,7 @@ impl Histogram {
 pub struct NormHistogram {
     table: [i32; 256],
     log2: u32,
-    max_symbol: u8,
+    table_len: usize,
 }
 
 impl NormHistogram {
@@ -311,7 +312,7 @@ impl NormHistogram {
 
     /// Iterate over the populated part of the symbol frequency table
     pub fn table_iter(&self) -> impl Iterator<Item = &i32> {
-        self.table.iter().take(self.max_symbol as usize + 1)
+        self.table.iter().take(self.table_len)
     }
 
     // Get the base-2 logarithm of the sum of the table.
@@ -324,14 +325,14 @@ impl NormHistogram {
         self.table.iter().map(|x| if *x == 0 { 1 } else { 0 }).sum()
     }
 
-    /// What the highest-numbered symbol seen was
-    pub fn max_symbol(&self) -> u8 {
-        self.max_symbol
+    /// The length of the histogram table (1 more than the maximum symbol seen)
+    pub fn table_len(&self) -> usize {
+        self.table_len
     }
 
     pub fn write_bound(&self) -> usize {
-        let max_header_size = (((self.max_symbol as usize + 1) * (self.log2 as usize)) >> 3) + 3;
-        if self.max_symbol > 0 {
+        let max_header_size = ((self.table_len * (self.log2 as usize)) >> 3) + 3;
+        if self.table_len > 1 {
             max_header_size
         } else {
             512
@@ -442,7 +443,7 @@ impl NormHistogram {
         let mut hist = Self {
             log2,
             table: [0; 256],
-            max_symbol: 255,
+            table_len: 256,
         };
         let mut symbol = 0;
         let mut threshold = 1 << hist.log2;
@@ -499,7 +500,7 @@ impl NormHistogram {
             return Err(HistError::TooManySymbols);
         }
 
-        hist.max_symbol = (symbol - 1) as u8;
+        hist.table_len = symbol;
 
         Ok((hist, reader.finish_byte()))
     }

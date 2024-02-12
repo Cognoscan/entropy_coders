@@ -13,7 +13,7 @@ const TABLE_LOG_DEFAULT: u32 = 11;
 pub fn fse_compress(src: &[u8], dst: &mut Vec<u8>) -> usize {
     let mut writer = BitStackWriter::new(dst);
     let hist = histogram::NormHistogram::new(src);
-    let fse_table = fse::FseTable::new(&hist);
+    let fse_table = fse::FseEncodeTable::new(&hist);
     let mut src_iter = src.iter().rev();
     let first = src_iter.next().unwrap();
     let mut encode = fse::FseEncode::new_first_symbol(&fse_table, *first);
@@ -33,7 +33,7 @@ pub fn fse_compress(src: &[u8], dst: &mut Vec<u8>) -> usize {
 pub fn fse_compress2(src: &[u8], dst: &mut Vec<u8>) -> usize {
     let mut writer = BitStackWriter::new(dst);
     let hist = histogram::NormHistogram::new(src);
-    let fse_table = fse::FseTable::new(&hist);
+    let fse_table = fse::FseEncodeTable::new(&hist);
     let mut src_iter = src.chunks(2).rev();
     let first = src_iter.next().unwrap();
     let (mut encode0, mut encode1) = if first.len() == 1 {
