@@ -26,6 +26,8 @@ pub fn fse_compress(src: &[u8], dst: &mut Vec<u8>) -> usize {
         writer.flush();
     }
     encode.finish(&mut writer);
+    // Marker bit, so the decoder knows where the final bit in the stream is.
+    writer.write_bits(1, 1);
     writer.finish()
 }
 
@@ -59,6 +61,8 @@ pub fn fse_compress2(src: &[u8], dst: &mut Vec<u8>) -> usize {
 
     encode0.finish(&mut writer);
     encode1.finish(&mut writer);
+    // Marker bit, so the decoder knows where the final bit in the stream is.
+    writer.write_bits(1, 1);
     writer.finish()
 }
 

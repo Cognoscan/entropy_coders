@@ -3,6 +3,48 @@ const BYTES: usize = BITS / 8;
 const HALF_BYTES: usize = BYTES / 2;
 const HALF_BITS: usize = BITS / 2;
 
+#[allow(dead_code)]
+const MASK: [usize; 33] = [
+    0,
+    0x1,
+    0x3,
+    0x7,
+    0xF,
+    0x1F,
+    0x3F,
+    0x7F,
+    0xFF,
+    0x1FF,
+    0x3FF,
+    0x7FF,
+    0xFFF,
+    0x1FFF,
+    0x3FFF,
+    0x7FFF,
+    0xFFFF,
+    0x1_FFFF,
+    0x3_FFFF,
+    0x7_FFFF,
+    0xF_FFFF,
+    0x1F_FFFF,
+    0x3F_FFFF,
+    0x7F_FFFF,
+    0xFF_FFFF,
+    0x1FF_FFFF,
+    0x3FF_FFFF,
+    0x7FF_FFFF,
+    0xFFF_FFFF,
+    0x1FFF_FFFF,
+    0x3FFF_FFFF,
+    0x7FFF_FFFF,
+    0xFFFF_FFFF,
+];
+
+#[inline]
+fn find_mask(val: usize) -> usize {
+    (1 << val) - 1
+}
+
 /// A tool for writing out a bit sequence.
 #[derive(Debug)]
 pub struct BitStackWriter<'a> {
@@ -133,13 +175,7 @@ impl<'a> BitStackWriter<'a> {
             "Can only write up to 16 bits at a time, but tried to write {} bits",
             bits
         );
-        const MASK: [usize; 17] = [
-            0, 0x1, 0x3, 0x7, 0xF, 0x1F, 0x3F, 0x7F, 0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF, 0x1FFF,
-            0x3FFF, 0x7FFF, 0xFFFF,
-        ];
-        // SAFETY: We're only ever writing up to 16 bits, so this offset should
-        // be OK.
-        let val = val & unsafe { MASK.get_unchecked(bits) };
+        let val = val & find_mask(bits);
         self.write_bits_raw(val, bits)
     }
 
@@ -176,16 +212,18 @@ impl<'a> BitStackWriter<'a> {
     /// less, and that the unused bits in `val` are 0.
     #[inline]
     pub fn write_bits(&mut self, val: usize, bits: usize) {
+        unsafe {
+            self.write_bits_raw(val, bits);
+        }
         self.flush();
-        unsafe { self.write_bits_raw(val, bits); }
     }
 
     /// Write up to 16 bits into the output stream. Assumes that `bits` is 16 or
     /// less.
     #[inline]
     pub fn write_bits_unmasked(&mut self, val: usize, bits: usize) {
-        self.flush();
         unsafe { self.write_bits_raw_unmasked(val, bits) }
+        self.flush();
     }
 
     /// Finish writing to the stack and return the number of bits written.
@@ -199,8 +237,10 @@ impl<'a> BitStackWriter<'a> {
         // Correct the vec to have the right length
         let total_size = unsafe { self.ptr.offset_from(self.writer.as_ptr()) as usize };
         let total_bits = total_size * 8 + actual_bits - BITS;
-        let new_len = (total_bits+7)/8;
-        unsafe { self.writer.set_len(new_len); }
+        let new_len = (total_bits + 7) / 8;
+        unsafe {
+            self.writer.set_len(new_len);
+        }
         // Return the total bytes written to the output
         total_bits - (self.initial_len * 8)
     }
@@ -210,124 +250,203 @@ impl<'a> BitStackWriter<'a> {
 #[derive(Clone, Debug)]
 pub struct BitStackReader<'a> {
     reader: &'a [u8],
-    available: usize,
-    last0: usize,
-    last1: usize,
+    ptr: *const u8,
+    bits: usize,
+    buffer: usize,
+    finished: bool,
 }
 
 impl<'a> BitStackReader<'a> {
-    /// Create a new bit reader. The slice provided should be exactly the
-    /// required number of bytes to contain the total number of bits stated.
-    pub fn new(reader: &'a [u8], total_bits: usize) -> Self {
-        assert!(!reader.is_empty(), "No bytes provided to read from");
-        assert!(
-            ((total_bits + 7) / 8) == reader.len(),
-            "Total number of bytes should be exactly enough to contain the total number of bits"
-        );
-
-        let mut word_offset = ((total_bits - 1) / BITS) * BYTES;
-        let mut last0 = 0;
-        for i in (0..BYTES).rev() {
-            if let Some(val) = reader.get(word_offset + i) {
-                last0 = (last0 << 8) | (*val as usize);
-            }
+    /// Create a new bit reader. This assumes there is a final marker bit set to
+    /// 1 to indicate the end of the bit stack, and fails to initialize if that
+    /// marker bit is missing.
+    pub fn new(reader: &'a [u8]) -> Option<Self> {
+        if reader.is_empty() {
+            return None;
         }
-
-        if word_offset + (BYTES / 2) > reader.len() {
-            word_offset = word_offset.saturating_sub(BYTES / 2);
-        } else {
-            word_offset += BYTES / 2;
-        }
-        let mut last1 = 0;
-        for i in (0..BYTES).rev() {
-            if let Some(val) = reader.get(word_offset + i) {
-                last1 = (last1 << 8) | (*val as usize);
-            }
-        }
-        Self {
-            reader,
-            available: total_bits,
-            last0,
-            last1,
-        }
-    }
-
-    /// Pop some bits off the buffer.
-    ///
-    /// `bits` must be greater than 0 and less than or equal to usize::BITS/2.
-    /// This is only checked in debug mode, as this is expected to be part of a
-    /// tight loop in regular code.
-    pub fn read(&mut self, bits: usize) -> std::io::Result<usize> {
-        let ret = self.peek(bits)?;
-        self.advance_by(bits)?;
-        Ok(ret)
-    }
-
-    /// Advance the buffer pointer by N bits.
-    ///
-    /// `bits` must be greater than 0 and less than or equal to usize::BITS/2.
-    /// This is only checked in debug mode, as this is expected to be part of a
-    /// tight loop in regular code.
-    pub fn advance_by(&mut self, bits: usize) -> std::io::Result<()> {
-        debug_assert!(bits <= BITS / 2);
-        debug_assert!(bits != 0);
-        if self.available < bits {
-            return Err(std::io::ErrorKind::UnexpectedEof.into());
-        }
-        self.available -= bits;
-        Ok(())
-    }
-
-    /// Peek at the next N bits in the buffer.
-    ///
-    /// `bits` must be greater than 0 and less than or equal to usize::BITS/2.
-    /// This is only checked in debug mode, as this is expected to be part of a
-    /// tight loop in regular code.
-    pub fn peek(&self, bits: usize) -> std::io::Result<usize> {
-        debug_assert!(bits <= BITS / 2);
-        debug_assert!(bits != 0);
-        if self.available < bits {
-            return Err(std::io::ErrorKind::UnexpectedEof.into());
-        }
-        let bit_ptr = self.available - bits;
-
-        // Set up the halfword/bit indices.
-        let idx = (bit_ptr / (BITS / 2)) * (BYTES / 2);
-        let bit_offset = bit_ptr & (BITS / 2 - 1);
-
-        let word = if idx + BYTES > self.reader.len() {
-            if (idx / (BYTES / 2)) & 1 == 1 {
-                self.last1
+        // Load our initial pointer. If we can align it now, we will do so.
+        //
+        // SAFETY: We just verified the reader isn't empty, so the end pointer
+        // can be rewound at least one byte. When we try to align the pointer,
+        // we also make sure to check that doing so won't put us past the start
+        // of the allocation.
+        let mut ptr = unsafe {
+            let ptr = reader.as_ptr_range().end.offset(-1);
+            // Try to align the buffer
+            let align = ptr.align_offset(HALF_BYTES);
+            // We can't even accidentally go past the start of the pointer, so check before we do
+            if ptr.offset_from(reader.as_ptr()) > (HALF_BYTES - align) as isize {
+                ptr.offset(align as isize - (HALF_BYTES as isize))
             } else {
-                self.last0
+                reader.as_ptr()
             }
-        } else {
-            // SAFETY: the earlier check should ensure that this code doesn't
-            // run unless we have at least BYTES available in the slice starting
-            // at `idx`. The cast should be safe because we literally just
-            // grabbed a slice of exactly size BYTES.
-            let bytes: &[u8; BYTES] = unsafe {
-                let bytes = self.reader.get_unchecked(idx..(idx + BYTES));
-                &*(bytes.as_ptr().cast::<[u8; BYTES]>())
-            };
-            usize::from_le_bytes(*bytes)
         };
 
-        // Apply the bit offset and mask just the desired bits.
-        let out = (word >> bit_offset) & ((1 << bits) - 1);
-        Ok(out)
+        // Manually read out the first few bytes
+        let to_read = reader.len() - (unsafe { ptr.offset_from(reader.as_ptr()) } as usize);
+        let mut bytes = [0; BYTES];
+        for (i, b) in bytes.iter_mut().take(to_read).enumerate() {
+            *b = unsafe { ptr.add(i).read() };
+        }
+        let buffer: usize = usize::from_le_bytes(bytes);
+        let bits = to_read * 8;
+        let finished = ptr == reader.as_ptr();
+        // Try to move the pointer down
+        unsafe {
+            if ptr.offset_from(reader.as_ptr()) >= (HALF_BYTES as isize) {
+                ptr = ptr.offset(-(HALF_BYTES as isize));
+            } else {
+                ptr = reader.as_ptr();
+            }
+        }
+        let mut this = Self {
+            reader,
+            ptr,
+            bits,
+            buffer,
+            finished,
+        };
+
+        // Do a standard reload in order to fully populate the stream
+        this.reload();
+
+        // With our bits read, it's time to figure out how many bits are
+        // actually present, by reading the marker bit at the end of the stream.
+        // If the slice had completely empty bytes at the end, we should fail
+        // and return None, as that means a framing error has occurred.
+        if this.buffer == 0 {
+            return None;
+        }
+        let highbit = this.buffer.ilog2() as usize;
+        if (this.bits - highbit) > 8 {
+            return None;
+        }
+
+        this.bits = highbit;
+        this.reload();
+        Some(this)
     }
 
-    /// Get how many bits are left in the buffer.
+    /// Replenish the internal buffer. Ensures that the internal buffer has at
+    /// least usize::BITS/2 bits left inside it, provided there were more bits
+    /// to retrieve.
+    pub fn reload(&mut self) {
+        // If we're finished, there's nothing to do.
+        if self.finished {
+            return;
+        }
+
+        // Final readout - we're at the base now
+        if self.ptr == self.reader.as_ptr() {
+            // This reads however many bytes are left between the base pointer
+            // and the next higher aligned value we would've previously read
+            // from.
+            let to_read = HALF_BYTES - ((self.ptr as usize) & (HALF_BYTES - 1));
+            // If we're actually reading bits this time around, then we're going
+            // to be finished.
+            self.finished = self.bits <= HALF_BITS;
+            // This mask ensures we actually *don't* have any effect if we're
+            // over half full (and thus may not have space to take on these
+            // extra bits)
+            let mask = self.finished as usize * usize::MAX;
+            let to_read = to_read & mask;
+
+            // Read the bits
+            let mut read_bytes = [0; HALF_BYTES];
+            for (i, b) in read_bytes.iter_mut().take(to_read).enumerate() {
+                *b = unsafe { self.ptr.add(i).read() };
+            }
+            #[cfg(target_pointer_width = "32")]
+            let read = u16::from_le_bytes(read_bytes);
+            #[cfg(target_pointer_width = "64")]
+            let read = u32::from_le_bytes(read_bytes);
+            let read_bits = 8 * to_read;
+
+            // Load the bits we read up into the the buffer. This time we don't
+            // need to mask the read part because it'll be 0 if we had `to_read`
+            // set to zero.
+            self.buffer = (self.buffer << read_bits) | (read as usize);
+            self.bits += read_bits;
+
+            return;
+        }
+
+        let will_read = (self.bits <= HALF_BITS) as usize;
+        let read_bits = will_read * HALF_BITS;
+        let read_mask = will_read * usize::MAX;
+
+        // Read in the bits, every time
+        // SAFETY: If we made it this far, then we're aligned (courtesy of the
+        // code in `new`), and we have at least HALF_BYTES available, as that's
+        // how many we would have subtracted our pointer by.
+        #[cfg(target_pointer_width = "32")]
+        let read = unsafe { self.ptr.cast::<u16>().read() };
+        #[cfg(target_pointer_width = "64")]
+        let read = unsafe { self.ptr.cast::<u32>().read() };
+
+        // Load the bits we read up into the buffer.
+        self.buffer = (self.buffer << read_bits) | ((read as usize) & read_mask);
+        self.bits += read_bits;
+
+        // Update the pointer, clamping to the base of the slice
+        self.ptr = if unsafe { self.ptr.offset_from(self.reader.as_ptr()) } >= (HALF_BYTES as isize)
+        {
+            unsafe { self.ptr.offset(-((will_read * HALF_BYTES) as isize)) }
+        } else {
+            self.reader.as_ptr()
+        };
+    }
+
+    /// Peek at the next N bits in the buffer, up to 16. Fails if there aren't
+    /// enough bits left in the buffer.
+    pub fn peek(&self, bits: usize) -> Option<usize> {
+        debug_assert!(bits <= 16, "Can't read more than 16 bits at a time");
+        if bits > self.bits {
+            return None;
+        }
+        Some((self.buffer >> (self.bits - bits)) & find_mask(bits))
+    }
+
+    /// Read bits out without reloading the buffer.
+    ///
+    /// # Safety
+    /// Only use this when you know the buffer should still have enough bits
+    /// left for your read (unless the buffer holds all remaining bits in the
+    /// stream).
+    ///
+    pub unsafe fn read_no_reload(&mut self, bits: usize) -> Option<usize> {
+        let read = self.peek(bits)?;
+        self.bits -= bits;
+        Some(read)
+    }
+
+    /// Advance the buffer manually, without reloading or checking for bit validity.
+    ///
+    /// # Safety
+    /// `bits` must be less than the number of remaining bits in the buffer, and
+    /// subsequent reads shouldn't deplete the remaining bits in the buffer.
+    pub unsafe fn advance_no_reload(&mut self, bits: usize) {
+        debug_assert!(bits <= self.bits);
+        self.bits -= bits;
+    }
+
+    /// Read the next N bits in the buffer, up to 16. Fails if there aren't
+    /// enough bits left in the buffer.
+    pub fn read(&mut self, bits: usize) -> Option<usize> {
+        let read = unsafe { self.read_no_reload(bits)? };
+        self.reload();
+        Some(read)
+    }
+
+    /// Get how many bits are left in the internal buffer
     pub fn available(&self) -> usize {
-        self.available
+        self.bits
     }
 
-    /// Finish reading. Returns the remaining byte slice and how many bits are
-    /// left in it.
-    pub fn finish(self) -> (&'a [u8], usize) {
-        let bytes = (self.available + 7) / 8;
-        (&self.reader[0..bytes], self.available)
+    /// Finish reading. Returns whether or not the slice was completely read out
+    /// or not.
+    pub fn finish(self) -> bool {
+        self.finished && self.bits == 0
     }
 }
 
@@ -472,7 +591,7 @@ mod tests {
 
     use super::*;
 
-    fn encode(test_vec: &[(usize, usize)]) -> (Vec<u8>, usize) {
+    fn encode(test_vec: &[(usize, usize)], mark: bool) -> (Vec<u8>, usize) {
         // Encode stage
         let mut encoded = Vec::new();
         let mut enc = BitStackWriter::new(&mut encoded);
@@ -481,12 +600,17 @@ mod tests {
             total_bits += bits;
             enc.write_bits(*val, *bits);
         }
-        let written_bits = enc.finish();
+        let written_bits = if mark {
+            enc.write_bits(1, 1);
+            enc.finish() - 1
+        } else {
+            enc.finish()
+        };
         assert_eq!(
             total_bits, written_bits,
             "Writer didn't actually write as many bits as we told it to"
         );
-        let total_bytes = (total_bits + 7) / 8;
+        let total_bytes = (total_bits + mark as usize + 7) / 8;
         assert_eq!(
             encoded.len(),
             total_bytes,
@@ -502,22 +626,31 @@ mod tests {
         (encoded, total_bits)
     }
 
-    fn decode_stack(encoded: &[u8], total_bits: usize, test_vec: &[(usize, usize)]) {
+    fn decode_stack(encoded: &[u8], test_vec: &[(usize, usize)]) {
         // Decode as a stack
-        let mut dec = BitStackReader::new(encoded, total_bits);
-        for (val, bits) in test_vec.iter().rev() {
-            let read_val = dec
-                .read(*bits)
-                .expect("Bitstack: Should have been able to read bits");
+        let mut dec = BitStackReader::new(encoded).unwrap();
+        println!("dec.buffer = 0x{:x}", dec.buffer);
+        println!("vec has {} pairs", test_vec.len());
+        for (i, (val, bits)) in test_vec.iter().enumerate().rev() {
+            let read_val = dec.read(*bits).unwrap_or_else(|| {
+                println!("dec.buffer = 0x{:x}", dec.buffer);
+                panic!(
+                    "Bitstack: Should have been able to read bits, failed on bit {} from start",
+                    i
+                )
+            });
             assert_eq!(
                 read_val, *val,
                 "Bitstack: Expected to get 0x{}, got 0x{}",
                 val, read_val
             );
         }
-        let (encoded, bits_left) = dec.finish();
-        assert!(encoded.is_empty());
-        assert!(bits_left == 0);
+        let bits_in_buf = dec.available();
+        assert!(dec.finish(), "Decoder wasn't finished");
+        assert!(
+            bits_in_buf == 0,
+            "Decoder still had bits left inside the internal buffer"
+        );
     }
 
     fn decode_stream(encoded: &[u8], total_bits: usize, test_vec: &[(usize, usize)]) {
@@ -544,8 +677,8 @@ mod tests {
         let mut test_vec = Vec::new();
         for i in 0..(BITS * 5) {
             test_vec.push((i & 0x1, 1));
-            let (encoded, total_bits) = encode(&test_vec);
-            decode_stack(&encoded, total_bits, &test_vec);
+            let (encoded, _) = encode(&test_vec, true);
+            decode_stack(&encoded, &test_vec);
         }
 
         // Repeat a few more times with random bits
@@ -556,8 +689,8 @@ mod tests {
             for _ in 0..(BITS * 5) {
                 let v: bool = rng.sample(dist);
                 test_vec.push((v as usize, 1));
-                let (encoded, total_bits) = encode(&test_vec);
-                decode_stack(&encoded, total_bits, &test_vec);
+                let (encoded, _) = encode(&test_vec, true);
+                decode_stack(&encoded, &test_vec);
             }
         }
 
@@ -571,8 +704,8 @@ mod tests {
                 let val: usize = rng.sample(dist_val);
                 let val = val & ((1 << bits) - 1);
                 test_vec.push((val, bits));
-                let (encoded, total_bits) = encode(&test_vec);
-                decode_stack(&encoded, total_bits, &test_vec);
+                let (encoded, _) = encode(&test_vec, true);
+                decode_stack(&encoded, &test_vec);
             }
         }
     }
@@ -582,7 +715,7 @@ mod tests {
         let mut test_vec = Vec::new();
         for i in 0..(BITS * 2) {
             test_vec.push((i & 0x1, 1));
-            let (encoded, total_bits) = encode(&test_vec);
+            let (encoded, total_bits) = encode(&test_vec, false);
             decode_stream(&encoded, total_bits, &test_vec);
         }
 
@@ -594,7 +727,7 @@ mod tests {
             for _ in 0..(BITS * 5) {
                 let v: bool = rng.sample(dist);
                 test_vec.push((v as usize, 1));
-                let (encoded, total_bits) = encode(&test_vec);
+                let (encoded, total_bits) = encode(&test_vec, false);
                 decode_stream(&encoded, total_bits, &test_vec);
             }
         }
@@ -609,7 +742,7 @@ mod tests {
                 let val: usize = rng.sample(dist_val);
                 let val = val & ((1 << bits) - 1);
                 test_vec.push((val, bits));
-                let (encoded, total_bits) = encode(&test_vec);
+                let (encoded, total_bits) = encode(&test_vec, false);
                 decode_stream(&encoded, total_bits, &test_vec);
             }
         }

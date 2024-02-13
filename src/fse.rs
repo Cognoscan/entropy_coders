@@ -288,9 +288,9 @@ pub struct FseDecode<'a> {
 
 impl<'a> FseDecode<'a> {
 
-    /// Initialize a stream decoder
-    pub fn new(table: &'a FseEncodeTable, reader: &mut BitStackReader) -> std::io::Result<Self> {
+    /// Initialize a stream decoder, failing if there aren't enough bits in the reader.
+    pub fn new(table: &'a FseEncodeTable, reader: &mut BitStackReader) -> Option<Self> {
         let value = reader.read(table.table_log as usize)? as u32;
-        Ok(Self { value, table })
+        Some(Self { value, table })
     }
 }
