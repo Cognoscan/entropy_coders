@@ -9,6 +9,51 @@ const TABLE_LOG_MAX: u32 = 15;
 const TABLE_LOG_RANGE: std::ops::RangeInclusive<u32> = TABLE_LOG_MIN..=TABLE_LOG_MAX;
 const TABLE_LOG_DEFAULT: u32 = 11;
 
+#[allow(dead_code)]
+const MASK: [usize; 33] = [
+    0,
+    0x1,
+    0x3,
+    0x7,
+    0xF,
+    0x1F,
+    0x3F,
+    0x7F,
+    0xFF,
+    0x1FF,
+    0x3FF,
+    0x7FF,
+    0xFFF,
+    0x1FFF,
+    0x3FFF,
+    0x7FFF,
+    0xFFFF,
+    0x1_FFFF,
+    0x3_FFFF,
+    0x7_FFFF,
+    0xF_FFFF,
+    0x1F_FFFF,
+    0x3F_FFFF,
+    0x7F_FFFF,
+    0xFF_FFFF,
+    0x1FF_FFFF,
+    0x3FF_FFFF,
+    0x7FF_FFFF,
+    0xFFF_FFFF,
+    0x1FFF_FFFF,
+    0x3FFF_FFFF,
+    0x7FFF_FFFF,
+    0xFFFF_FFFF,
+];
+
+// Fast Mask lookup. It's quicker to read in the mask value than it is to
+// calculate it with a shift & subtract.
+#[inline]
+fn find_mask(val: usize) -> usize {
+    debug_assert!(val <= 32, "Masking shouldn't be above 32 bits at any point");
+    unsafe { *MASK.get_unchecked(val) }
+}
+
 /// Run the compressor directly
 pub fn fse_compress(src: &[u8], dst: &mut Vec<u8>) -> usize {
     let mut writer = BitStackWriter::new(dst);
