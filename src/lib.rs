@@ -64,11 +64,11 @@ pub fn fse_compress(src: &[u8], dst: &mut Vec<u8>) -> (NormHistogram, usize) {
 
     // Encode the symbol stream
     let mut writer = BitStackWriter::new(dst);
-    let fse_table = fse::FseEncodeTable::new(&hist);
+    let fse_table = fse::EncodeTable::new(&hist);
     let mut src_iter = src.chunks(2).rev();
     let first = src_iter.next().unwrap();
     let first_byte = first.last().unwrap();
-    let mut encode = fse::FseEncode::new_first_symbol(&fse_table, *first_byte);
+    let mut encode = fse::Encoder::new_first_symbol(&fse_table, *first_byte);
     if first.len() > 1 {
         encode.encode(&mut writer, *first.first().unwrap());
     }
@@ -97,18 +97,18 @@ pub fn fse_compress2(src: &[u8], dst: &mut Vec<u8>) -> usize {
     hist.write(dst);
 
     let mut writer = BitStackWriter::new(dst);
-    let fse_table = fse::FseEncodeTable::new(&hist);
+    let fse_table = fse::EncodeTable::new(&hist);
     let mut src_iter = src.chunks(2).rev();
     let first = src_iter.next().unwrap();
     let (mut encode0, mut encode1) = if first.len() == 1 {
         let next = src_iter.next().unwrap();
-        let mut encode0 = fse::FseEncode::new_first_symbol(&fse_table, first[0]);
-        let encode1 = fse::FseEncode::new_first_symbol(&fse_table, next[1]);
+        let mut encode0 = fse::Encoder::new_first_symbol(&fse_table, first[0]);
+        let encode1 = fse::Encoder::new_first_symbol(&fse_table, next[1]);
         encode0.encode(&mut writer, next[0]);
         (encode0, encode1)
     } else {
-        let encode0 = fse::FseEncode::new_first_symbol(&fse_table, first[0]);
-        let encode1 = fse::FseEncode::new_first_symbol(&fse_table, first[1]);
+        let encode0 = fse::Encoder::new_first_symbol(&fse_table, first[0]);
+        let encode1 = fse::Encoder::new_first_symbol(&fse_table, first[1]);
         (encode0, encode1)
     };
 
@@ -139,8 +139,8 @@ pub fn fse_decompress(src: &[u8], dst: &mut Vec<u8>) -> Option<usize> {
     let mut reader = bitstream::BitStackReader::new(src)?;
 
     // Decode the stream
-    let fse_table = fse::FseDecodeTable::new(&hist);
-    let mut decode = fse::FseDecode::new(&fse_table, &mut reader).unwrap();
+    let fse_table = fse::DecodeTable::new(&hist);
+    let mut decode = fse::Decoder::new(&fse_table, &mut reader).unwrap();
     while let Some(s) = decode.decode_symbol(&mut reader) {
         dst.push(s);
         if usize::BITS >= 64 {

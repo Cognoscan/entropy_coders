@@ -2,7 +2,7 @@ use thiserror::Error;
 
 use crate::{
     bitstream::{BitStackWriter, BitStreamReader},
-    TABLE_LOG_DEFAULT, TABLE_LOG_MAX, TABLE_LOG_MIN, TABLE_LOG_RANGE,
+    TABLE_LOG_DEFAULT, TABLE_LOG_MAX, TABLE_LOG_MIN,
 };
 
 /// A histogram of all the 8-bit symbols seen in a data sequence.
@@ -90,13 +90,12 @@ impl Histogram {
         self.size
     }
 
-    /// Normalize the histogram. Panics if log2 is not between 5 and 15.
+    /// Normalize the histogram such that it sums to `2**log2`. If `log2` is
+    /// outside the accepted range, it is changed automatically.
     pub fn normalize(self, log2: u32) -> NormHistogram {
-        assert!(
-            TABLE_LOG_RANGE.contains(&log2),
-            "Histogram normalization: log2 must be between 5 & 15, but is {}",
-            log2
-        );
+        let log2 = log2
+            .clamp(TABLE_LOG_MIN, TABLE_LOG_MAX)
+            .max((self.table_len - 1).ilog2() + 2);
 
         const RTB_TABLE: [u32; 8] = [0, 473195, 504333, 520860, 550000, 700000, 750000, 830000];
 
@@ -265,17 +264,25 @@ impl Histogram {
     pub fn optimal_log2(&self) -> u32 {
         // Minimum number of bits for safely encoding a distribution
         let min_bits_src = (self.size).ilog2() + 1;
-        let min_bits_symbols = self.table_len.ilog2() + 2;
+        let min_bits_symbols = (self.table_len - 1).ilog2() + 2;
         let min_bits = min_bits_src.min(min_bits_symbols);
 
         // Maximum number of bits a distribution could reasonably benefit from
         let max_bits = (self.size - 1).ilog2() - 2;
 
         TABLE_LOG_DEFAULT
-            .max(min_bits)
             .min(max_bits)
+            .max(min_bits)
             .clamp(TABLE_LOG_MIN, TABLE_LOG_MAX)
     }
+
+    /// Normalize the histogram to a power of two, selecting a power of two
+    /// that's best for a given table size.
+    pub fn normalize_optimal(self) -> NormHistogram {
+        let log2 = self.optimal_log2();
+        self.normalize(log2)
+    }
+
 }
 
 /// A normalized histogram. Uses the special value "-1" to indicate a
@@ -499,6 +506,34 @@ impl NormHistogram {
     }
 }
 
+impl TryFrom<[i32; 256]> for NormHistogram {
+    type Error = ();
+
+    /// Attempt to parse a raw histogram table into a normalized histogram.
+    fn try_from(value: [i32; 256]) -> Result<Self, Self::Error> {
+        // Find the power of two for this raw table
+        let sum = value.iter().map(|x| x.unsigned_abs() as u64).sum::<u64>();
+        let log2 = sum.ilog2();
+        if (1<<log2) != sum { return Err(()); }
+
+        // Figure out the total table size
+        let mut table_len = 0;
+        for (i, x) in value.iter().enumerate().rev() {
+            if *x != 0 {
+                table_len = i;
+                break;
+            }
+        }
+        table_len += 1;
+
+        Ok(NormHistogram {
+            table: value,
+            log2,
+            table_len,
+        })
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum HistError {
     #[error("Table log2 size is {0}, higher than the accepted maximum")]
@@ -528,6 +563,7 @@ mod tests {
         }
         println!("]");
         let sum: i32 = norm_hist.table.iter().map(|x| x.abs()).sum();
+        let log2 = norm_hist.log2_sum();
         assert_eq!(sum, 1 << log2);
         for (i, (h, hn)) in hist_table.iter().zip(norm_hist.table().iter()).enumerate() {
             assert_eq!(
@@ -547,6 +583,12 @@ mod tests {
         let (dec_hist, rem) = NormHistogram::read(&enc).unwrap();
         assert_eq!(rem, test);
         assert_eq!(norm_hist, dec_hist);
+    }
+
+    #[test]
+    fn flat_256() {
+        let data = (0u8..=255u8).collect::<Vec<u8>>();
+        NormHistogram::new(&data);
     }
 
     #[test]

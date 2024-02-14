@@ -28,8 +28,7 @@ mod tests {
 
     fn encode(test_vec: &[(usize, usize)], cfg: EncodeCfg) -> (Vec<u8>, usize) {
         // Encode stage
-        let mut encoded = Vec::new();
-        for _ in 0..cfg.offset { encoded.push(0); }
+        let mut encoded = vec![0; cfg.offset];
         let mut enc = BitStackWriter::new(&mut encoded);
         let mut total_bits = 0;
         for (val, bits) in test_vec {

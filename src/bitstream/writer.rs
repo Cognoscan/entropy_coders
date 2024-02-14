@@ -132,10 +132,11 @@ impl<'a> BitStackWriter<'a> {
     /// masked before writing.
     ///
     /// # Safety
-    /// This can cause data loss unless [`flush`] is run at at least every time
-    /// up to 1/2 of the total internal buffer's size has been written - on
-    /// 32-bit architectures, this means flushing every 16 potential bits, and
-    /// on 64-bit architectures, this means flushing every 32 potential bits.
+    /// This can cause data loss unless [`flush`][BitStackWriter::flush] is run
+    /// at least every time up to 1/2 of the total internal buffer's size has
+    /// been written - on 32-bit architectures, this means flushing every 16
+    /// potential bits, and on 64-bit architectures, this means flushing every
+    /// 32 potential bits.
     ///
     #[inline]
     pub unsafe fn write_bits_raw_unmasked(&mut self, val: usize, bits: usize) {
@@ -154,10 +155,11 @@ impl<'a> BitStackWriter<'a> {
     /// only ones allowed to be set to 1, all upper bits must be zero.
     ///
     /// # Safety
-    /// This can cause data loss unless [`flush`] is run at at least every time
-    /// up to 1/2 of the total internal buffer's size has been written - on
-    /// 32-bit architectures, this means flushing every 16 potential bits, and
-    /// on 64-bit architectures, this means flushing every 32 potential bits.
+    /// This can cause data loss unless [`flush`][BitStackWriter::flush] is run
+    /// at least every time up to 1/2 of the total internal buffer's size has
+    /// been written - on 32-bit architectures, this means flushing every 16
+    /// potential bits, and on 64-bit architectures, this means flushing every
+    /// 32 potential bits.
     ///
     #[inline]
     pub unsafe fn write_bits_raw(&mut self, val: usize, bits: usize) {

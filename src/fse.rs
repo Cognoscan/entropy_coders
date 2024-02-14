@@ -1,3 +1,63 @@
+/*!
+# Finite State Entropy (tANS) Implementation
+
+These components provide the fundamental tools for implementing a tANS encoder
+and decoder, referred to here as Finite State Entropy. These are specifically
+for replicating the encoding/decoding scheme used by `zstd`, though it certainly
+can be used in other compression schemes.
+
+## Usage: Compression
+
+First, a [normalized histogram][crate::histogram::NormHistogram] must be built
+up for use with the entropy coder. Then, an [`EncodeTable`] can be constructed
+from it. This table can be used with one or more [`Encoder`] units to compress
+the data used to create the histogram.
+
+Encoders can be interleaved or used alongside additional bits, as each one only
+mutably borrows the [`BitStackWriter`] when encoding a symbol.
+
+Fine-grained `unsafe` functions for encoding a symbol without flushing bits out
+of the writer are available for achieving the fastest possible encoding speeds,
+at the cost of additional manual reasoning about the maximum number of bits per
+encoding operation.
+
+Here's an example flow, using a single encoder. The output is finished with a
+"1" marker bit in order for the decoder to identify the final bit in the byte
+stream (same as `zstd`). Note that the histogram is not encoded in this
+sequence; it must either be encoded before the main encoding sequence, or be
+derived separately.
+
+```
+# use entropy_coders::fse::*;
+# use entropy_coders::histogram::*;
+# use entropy_coders::bitstream::*;
+# let data = (0u8..=255u8).collect::<Vec<u8>>();
+
+// Given `data` as the source Vec<u8>, construct the encoding table
+let hist = NormHistogram::new(&data);
+let table = EncodeTable::new(&hist);
+
+// Prepare the encoder and implicitly encode the first byte. Because the
+// bitstream must be read in reverse order, we reverse *now* so that the decoder
+// outputs bytes in the same order as the original data vector.
+let mut iter = data.iter().rev();
+// Note: In a real encoder, zero-sized data should be caught before this point.
+let first = iter.next().unwrap();
+let mut encoder = Encoder::new_first_symbol(&table, *first);
+
+let mut output = Vec::with_capacity(data.len());
+let mut writer = BitStackWriter::new(&mut output);
+for n in iter {
+    encoder.encode(&mut writer, *n);
+}
+encoder.finish(&mut writer);
+writer.write_bits(1, 1);
+writer.finish();
+```
+
+*/
+
+
 use crate::bitstream::{BitStackReader, BitStackWriter};
 use crate::histogram::NormHistogram;
 use crate::{find_mask, TABLE_LOG_RANGE};
@@ -11,7 +71,7 @@ fn table_step(size: usize) -> usize {
 }
 
 #[derive(Clone, Debug)]
-pub struct FseEncodeTable {
+pub struct EncodeTable {
     table_log: u32,
     table: Vec<u16>,
     symbol_tt: [SymbolTransform; 256],
@@ -24,7 +84,7 @@ struct SymbolTransform {
     find_state: i32,
 }
 
-impl FseEncodeTable {
+impl EncodeTable {
     /// Construct a new FSE table from a provided normalized histogram.
     pub fn new(hist: &NormHistogram) -> Self {
         let size = 1 << hist.log2_sum();
@@ -135,20 +195,20 @@ impl FseEncodeTable {
 }
 
 #[derive(Debug)]
-pub struct FseEncode<'a> {
+pub struct Encoder<'a> {
     value: u32,
-    table: &'a FseEncodeTable,
+    table: &'a EncodeTable,
 }
 
-impl<'a> FseEncode<'a> {
-    pub fn new(table: &'a FseEncodeTable) -> Self {
+impl<'a> Encoder<'a> {
+    pub fn new(table: &'a EncodeTable) -> Self {
         Self { value: 0, table }
     }
 
-    /// Same as [`new`], except that the first symbol to encode (and thus the
-    /// last that will be read) uses the smallest state value possible, saving
-    /// the cost of this symbol.
-    pub fn new_first_symbol(table: &'a FseEncodeTable, first_symbol: u8) -> Self {
+    /// Same as [`Encoder::new`], except that the first symbol to encode (and
+    /// thus the last that will be read) uses the smallest state value possible,
+    /// saving the cost of this symbol.
+    pub fn new_first_symbol(table: &'a EncodeTable, first_symbol: u8) -> Self {
         let mut this = Self::new(table);
         let symbol_tt = this.table.symbol_tt[first_symbol as usize];
         let bits_out = (symbol_tt.bits + (1 << 15)) >> 16;
@@ -192,7 +252,7 @@ impl<'a> FseEncode<'a> {
 }
 
 #[derive(Clone, Debug)]
-pub struct FseDecodeTable {
+pub struct DecodeTable {
     table_log: u32,
     fast_mode: bool,
     table: Vec<DecodeTransform>,
@@ -205,7 +265,7 @@ struct DecodeTransform {
     num_bits: u8,
 }
 
-impl FseDecodeTable {
+impl DecodeTable {
     /// Create a new FSE decoding table from a normalized histogram.
     pub fn new(hist: &NormHistogram) -> Self {
         let mut this = Self {
@@ -280,14 +340,14 @@ impl FseDecodeTable {
 }
 
 #[derive(Debug)]
-pub struct FseDecode<'a> {
+pub struct Decoder<'a> {
     state: u16,
-    table: &'a FseDecodeTable,
+    table: &'a DecodeTable,
 }
 
-impl<'a> FseDecode<'a> {
+impl<'a> Decoder<'a> {
     /// Initialize a stream decoder, failing if there aren't enough bits in the reader.
-    pub fn new(table: &'a FseDecodeTable, reader: &mut BitStackReader) -> Option<Self> {
+    pub fn new(table: &'a DecodeTable, reader: &mut BitStackReader) -> Option<Self> {
         let state = reader.read(table.table_log as usize)? as u16;
         Some(Self { state, table })
     }
@@ -335,11 +395,11 @@ mod tests {
     pub fn fse_compress(src: &[u8], dst: &mut Vec<u8>) -> (NormHistogram, usize) {
         let mut writer = BitStackWriter::new(dst);
         let hist = NormHistogram::new(src);
-        let fse_table = FseEncodeTable::new(&hist);
+        let fse_table = EncodeTable::new(&hist);
         let mut src_iter = src.chunks(2).rev();
         let first = src_iter.next().unwrap();
         let first_byte = first.last().unwrap();
-        let mut encode = FseEncode::new_first_symbol(&fse_table, *first_byte);
+        let mut encode = Encoder::new_first_symbol(&fse_table, *first_byte);
         if first.len() > 1 {
             encode.encode(&mut writer, *first.first().unwrap());
         }
@@ -365,8 +425,8 @@ mod tests {
     pub fn fse_decompress(hist: &NormHistogram, src: &[u8], dst: &mut Vec<u8>) -> Option<usize> {
         let len = dst.len();
         let mut reader = BitStackReader::new(src)?;
-        let fse_table = FseDecodeTable::new(hist);
-        let mut decode = FseDecode::new(&fse_table, &mut reader).unwrap();
+        let fse_table = DecodeTable::new(hist);
+        let mut decode = Decoder::new(&fse_table, &mut reader).unwrap();
         while let Some(s) = decode.decode_symbol(&mut reader) {
             dst.push(s);
         }
