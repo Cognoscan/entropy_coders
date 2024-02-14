@@ -57,7 +57,6 @@ fn find_mask(val: usize) -> usize {
 }
 
 pub fn fse_compress(src: &[u8], dst: &mut Vec<u8>) -> (NormHistogram, usize) {
-
     // Construct the histogram and write it out
     let hist = NormHistogram::new(src);
     hist.write(dst);
@@ -114,23 +113,24 @@ pub fn fse_compress2(src: &[u8], dst: &mut Vec<u8>) -> usize {
 
     for n in src_iter {
         unsafe {
-            encode0.encode_raw(&mut writer, *n.get_unchecked(0));
+            encode1.encode_raw(&mut writer, *n.get_unchecked(1));
             if usize::BITS < 64 {
                 writer.flush();
             }
-            encode1.encode_raw(&mut writer, *n.get_unchecked(1));
+            encode0.encode_raw(&mut writer, *n.get_unchecked(0));
             writer.flush();
         }
     }
 
-    encode0.finish(&mut writer);
     encode1.finish(&mut writer);
+    encode0.finish(&mut writer);
     // Marker bit, so the decoder knows where the final bit in the stream is.
     writer.write_bits(1, 1);
     writer.finish()
 }
 
-// Run the decompressor on a stream compressed with `fse_compress`.
+// Run the decompressor on a stream compressed with `fse_compress`, returning
+// how many bytes were added to the output stream.
 pub fn fse_decompress(src: &[u8], dst: &mut Vec<u8>) -> Option<usize> {
     let len = dst.len();
 
@@ -146,13 +146,88 @@ pub fn fse_decompress(src: &[u8], dst: &mut Vec<u8>) -> Option<usize> {
         if usize::BITS >= 64 {
             if let Some(s) = unsafe { decode.decode_symbol_no_reload(&mut reader) } {
                 dst.push(s);
-            }
-            else {
+            } else {
                 break;
             }
         }
     }
     dst.push(decode.finish());
+    Some(dst.len() - len)
+}
+
+// Run the decompressor on a stream compressed with `fse_compress2`, returning
+// how many bytes were added to the output stream.
+pub fn fse_decompress2(src: &[u8], dst: &mut Vec<u8>) -> Option<usize> {
+    struct DeferVec<'a> {
+        v: &'a mut Vec<u8>,
+        ptr: *mut u8,
+        end: *mut u8,
+    }
+
+    impl<'a> DeferVec<'a> {
+        fn new(v: &'a mut Vec<u8>) -> Self {
+            let spare = v.spare_capacity_mut().as_mut_ptr_range();
+            Self {
+                v,
+                ptr: spare.start as *mut u8,
+                end: spare.end as *mut u8,
+            }
+        }
+
+        #[cold]
+        unsafe fn reserve(&mut self, additional: usize) {
+            self.v
+                .set_len(self.ptr.offset_from(self.v.as_ptr()) as usize);
+            self.v.reserve(additional);
+            let spare = self.v.spare_capacity_mut().as_mut_ptr_range();
+            self.ptr = spare.start as *mut u8;
+            self.end = spare.end as *mut u8;
+        }
+
+        unsafe fn push(&mut self, val: u8) {
+            if self.ptr == self.end {
+                self.reserve(1);
+            }
+            self.ptr.write(val);
+            self.ptr = self.ptr.add(1);
+        }
+
+        unsafe fn finish(self) {
+            self.v
+                .set_len(self.ptr.offset_from(self.v.as_ptr()) as usize);
+        }
+    }
+    let len = dst.len();
+
+    // Recover the histogram
+    let (hist, src) = NormHistogram::read(src).ok()?;
+
+    // Decode the stream
+    let mut reader = bitstream::BitStackReader::new(src)?;
+    let fse_table = fse::DecodeTable::new(&hist);
+    let mut decode0 = fse::Decoder::new(&fse_table, &mut reader).unwrap();
+    let mut decode1 = fse::Decoder::new(&fse_table, &mut reader).unwrap();
+    let mut fast_dst = DeferVec::new(dst);
+    unsafe {
+        while let Some(s) = decode0.decode_symbol_no_reload(&mut reader) {
+            fast_dst.push(s);
+            if usize::BITS < 64 {
+                reader.reload();
+            }
+            if let Some(s) = decode1.decode_symbol(&mut reader) {
+                fast_dst.push(s);
+            } else {
+                fast_dst.push(decode1.finish());
+                fast_dst.push(decode0.finish());
+                fast_dst.finish();
+                return Some(dst.len() - len);
+            }
+        }
+        fast_dst.push(decode0.finish());
+        fast_dst.push(decode1.finish());
+        fast_dst.finish();
+    }
+
     Some(dst.len() - len)
 }
 

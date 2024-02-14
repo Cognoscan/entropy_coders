@@ -230,12 +230,12 @@ impl<'a> Encoder<'a> {
         let bits_out = (symbol_tt.bits + self.value) >> 16;
         writer.write_bits_raw_unmasked(self.value as usize, bits_out as usize);
         let idx = ((self.value >> bits_out) as i32 + symbol_tt.find_state) as usize;
-        println!(
-            "write byte {:02x}, using {} bits, put 0x{:04x} on the stream",
-            sym,
-            bits_out,
-            self.value as usize & find_mask(bits_out as usize)
-        );
+        //println!(
+        //    "write byte {:02x}, using {} bits, put 0x{:04x} on the stream",
+        //    sym,
+        //    bits_out,
+        //    self.value as usize & find_mask(bits_out as usize)
+        //);
         self.value = *self.table.table.get_unchecked(idx) as u32;
     }
 
@@ -365,10 +365,10 @@ impl<'a> Decoder<'a> {
         let state_info = self.state_lookup();
         let low_bits = reader.read_no_reload(state_info.num_bits as usize)?;
         let sym = state_info.symbol;
-        println!(
-            "Read byte {:02x}, take {} bits, got 0x{:04x} off the stream",
-            sym, state_info.num_bits, low_bits
-        );
+        //println!(
+        //    "Read byte {:02x}, take {} bits, got 0x{:04x} off the stream",
+        //    sym, state_info.num_bits, low_bits
+        //);
         self.state = state_info.new_state + (low_bits as u16);
         Some(sym)
     }

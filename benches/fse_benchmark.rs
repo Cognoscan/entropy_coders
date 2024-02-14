@@ -37,6 +37,13 @@ fn time_benchmark(c: &mut Criterion) {
         dst.clear();
         entropy_coders::fse_compress2(black_box(src.as_slice()), &mut dst)
     }));
+    dst.clear();
+    entropy_coders::fse_compress2(src.as_slice(), &mut dst);
+    let mut dec = Vec::with_capacity(src.len());
+    group.bench_function("decompress_20", |b| b.iter(|| {
+        dec.clear();
+        entropy_coders::fse_decompress2(black_box(dst.as_slice()), &mut dec)
+    }));
     group.finish();
 }
 
