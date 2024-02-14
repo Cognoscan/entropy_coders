@@ -18,10 +18,17 @@ impl<'a> BitStackWriter<'a> {
         let initial_len = writer.len();
         let spare = writer.spare_capacity_mut().as_mut_ptr_range();
         let ptr = spare.start as *mut u8;
+        // Find the last aligned pointer that's still inside the Vec (or 1 past the end).
+        // SAFETY: We should be able to do this because we had previously
+        // reserved at least 2*BYTES bytes in the vec.
         let end_ptr = unsafe {
-            spare
-                .end
-                .offset(spare.end.align_offset(HALF_BYTES) as isize - (HALF_BYTES as isize))
+            let align = spare.end.align_offset(HALF_BYTES);
+            if align != 0 {
+                spare.end.offset(align as isize - (HALF_BYTES as isize))
+            }
+            else {
+                spare.end
+            }
         } as *const u8;
         Self {
             writer,
@@ -35,10 +42,12 @@ impl<'a> BitStackWriter<'a> {
 
     #[inline]
     pub fn flush(&mut self) {
-        if self.ptr.align_offset(HALF_BYTES) != 0 {
+        let align = self.ptr.align_offset(HALF_BYTES);
+        if align != 0 {
             // We're not aligned yet, so now it's time to dump some bytes
             // We'll only write enough to bring us into alignment
-            let to_write = (self.bits / 8) & (HALF_BYTES - 1);
+            let to_write = (self.bits / 8).min(align);
+            debug_assert!(to_write < HALF_BYTES);
             let bytes = self.storage.to_le_bytes();
             // SAFETY:
             // The pointer math is guaranteed to be safe because we first made
@@ -56,9 +65,9 @@ impl<'a> BitStackWriter<'a> {
                     self.ptr.add(2).write(bytes[2]);
                 }
                 self.ptr = self.ptr.add(to_write);
-                self.storage >>= to_write * 8;
-                self.bits -= to_write * 8;
             }
+            self.storage >>= to_write * 8;
+            self.bits -= to_write * 8;
             // If this didn't align us, return early.
             if self.ptr.align_offset(HALF_BYTES) != 0 {
                 return;
@@ -82,16 +91,22 @@ impl<'a> BitStackWriter<'a> {
             self.bits -= inc * HALF_BITS;
             self.ptr = self.ptr.add(inc * HALF_BYTES);
             // Handle a full buffer
-            if self.ptr.offset_from(self.end_ptr) == 0 {
+            if (self.ptr as *const u8) == self.end_ptr {
                 self.writer
                     .set_len(self.ptr.offset_from(self.writer.as_ptr()) as usize);
-                self.writer.reserve(self.writer.len() * 2);
+                self.writer.reserve(self.writer.len() * 2 + HALF_BYTES);
                 let spare = self.writer.spare_capacity_mut().as_mut_ptr_range();
                 self.ptr = spare.start as *mut u8;
-                self.end_ptr = spare
-                    .end
-                    .offset(spare.end.align_offset(HALF_BYTES) as isize - (HALF_BYTES as isize))
-                    as *const u8;
+
+                self.end_ptr = {
+                    let align = spare.end.align_offset(HALF_BYTES);
+                    if align != 0 {
+                        spare.end.offset(align as isize - (HALF_BYTES as isize))
+                    }
+                    else {
+                        spare.end
+                    }
+                } as *const u8;
             }
         }
     }
@@ -161,6 +176,7 @@ impl<'a> BitStackWriter<'a> {
         // OR in the bits and update the state
         self.storage |= val << self.bits;
         self.bits += bits;
+        //println!("write: {:04x}, {} bits", val, bits);
     }
 
     /// Write up to 16 bits into the output stream. Assumes that `bits` is 16 or
@@ -183,15 +199,20 @@ impl<'a> BitStackWriter<'a> {
 
     /// Finish writing to the stack and return the number of bits written.
     pub fn finish(mut self) -> usize {
+        // Figure out how many bits we have in the buffer at the end
+        let total_size = unsafe { self.ptr.offset_from(self.writer.as_ptr()) as usize };
+        let actual_bits = self.bits;
+        let total_bits = total_size * 8 + actual_bits;
+
         // Double-flush to push out all the remaining bits. We pretend we have a
         // completely full buffer to make sure we get everything out.
-        let actual_bits = self.bits;
         self.bits = BITS;
         self.flush();
+        self.bits = BITS;
         self.flush();
+
         // Correct the vec to have the right length
-        let total_size = unsafe { self.ptr.offset_from(self.writer.as_ptr()) as usize };
-        let total_bits = total_size * 8 + actual_bits - BITS;
+        //println!("total_size = {}, actual_bits = {}, total_bits = {}", total_size, actual_bits, total_bits);
         let new_len = (total_bits + 7) / 8;
         unsafe {
             self.writer.set_len(new_len);

@@ -60,6 +60,12 @@ impl<'a> BitStackReader<'a> {
             buffer,
             finished,
         };
+        //println!(
+        //    "read.new: load {:08x}, {} bits, ptr = {:x}",
+        //    buffer,
+        //    to_read * 8,
+        //    this.ptr as usize
+        //);
 
         // Do a standard reload in order to fully populate the stream
         this.reload();
@@ -76,6 +82,10 @@ impl<'a> BitStackReader<'a> {
             return None;
         }
 
+        //println!(
+        //    "read.new: adjusted to hold {} bits from {} bits",
+        //    highbit, this.bits
+        //);
         this.bits = highbit;
         this.reload();
         Some(this)
@@ -87,6 +97,7 @@ impl<'a> BitStackReader<'a> {
     pub fn reload(&mut self) {
         // If we're finished, there's nothing to do.
         if self.finished {
+            //println!("read.reload: finished");
             return;
         }
 
@@ -121,6 +132,10 @@ impl<'a> BitStackReader<'a> {
             // set to zero.
             self.buffer = (self.buffer << read_bits) | (read as usize);
             self.bits += read_bits;
+            //println!(
+            //    "read.reload: base ptr reads {:08x}, {} bits, ptr = {:x}",
+            //    read, read_bits, self.ptr as usize
+            //);
 
             return;
         }
@@ -143,12 +158,18 @@ impl<'a> BitStackReader<'a> {
         self.bits += read_bits;
 
         // Update the pointer, clamping to the base of the slice
-        self.ptr = if unsafe { self.ptr.offset_from(self.reader.as_ptr()) } >= (HALF_BYTES as isize)
+        let base_offset = unsafe { self.ptr.offset_from(self.reader.as_ptr()) };
+        self.ptr = if base_offset >= (HALF_BYTES as isize)
         {
             unsafe { self.ptr.offset(-((will_read * HALF_BYTES) as isize)) }
         } else {
-            self.reader.as_ptr()
+            // we have to decrement to reach the base pointer only if we're at the end
+            unsafe { self.ptr.offset(-(will_read as isize * base_offset)) }
         };
+        //println!(
+        //    "read.reload: reads {:08x}, {} bits, ptr = {:x}",
+        //    read, read_bits, self.ptr as usize
+        //);
     }
 
     /// Peek at the next N bits in the buffer, up to 16. Fails if there aren't
@@ -158,7 +179,9 @@ impl<'a> BitStackReader<'a> {
         if bits > self.bits {
             return None;
         }
-        Some((self.buffer >> (self.bits - bits)) & find_mask(bits))
+        let val = (self.buffer >> (self.bits - bits)) & find_mask(bits);
+        //println!("read: {:04x}, {} bits", val, bits);
+        Some(val)
     }
 
     /// Read bits out without reloading the buffer.

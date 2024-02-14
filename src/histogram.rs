@@ -2,7 +2,7 @@ use thiserror::Error;
 
 use crate::{
     bitstream::{BitStackWriter, BitStreamReader},
-    TABLE_LOG_MAX, TABLE_LOG_MIN, TABLE_LOG_RANGE, TABLE_LOG_DEFAULT,
+    TABLE_LOG_DEFAULT, TABLE_LOG_MAX, TABLE_LOG_MIN, TABLE_LOG_RANGE,
 };
 
 /// A histogram of all the 8-bit symbols seen in a data sequence.
@@ -192,12 +192,7 @@ impl Histogram {
         // Do another round of distributing low-probability values
         if (total / to_distribute) > low_one {
             let low = (total * 3) / (to_distribute * 2);
-            for (&t, t_norm) in self
-                .table
-                .iter()
-                .zip(table.iter_mut())
-                .take(self.table_len)
-            {
+            for (&t, t_norm) in self.table.iter().zip(table.iter_mut()).take(self.table_len) {
                 if *t_norm == UNASSIGNED && t <= low {
                     *t_norm = 1;
                     to_distribute -= 1;
@@ -244,12 +239,7 @@ impl Histogram {
             let mid: u64 = (1 << (v_step_log - 1)) - 1;
             let r_step: u64 = (((1 << v_step_log) * (to_distribute as u64)) + mid) / (total as u64);
             let mut tmp_total = mid;
-            for (&t, t_norm) in self
-                .table
-                .iter()
-                .zip(table.iter_mut())
-                .take(self.table_len)
-            {
+            for (&t, t_norm) in self.table.iter().zip(table.iter_mut()).take(self.table_len) {
                 if *t_norm == UNASSIGNED {
                     let end = tmp_total + (t as u64 * r_step);
                     let s_start = tmp_total >> v_step_log;
@@ -282,7 +272,8 @@ impl Histogram {
         let max_bits = (self.size - 1).ilog2() - 2;
 
         TABLE_LOG_DEFAULT
-            .clamp(min_bits, max_bits)
+            .max(min_bits)
+            .min(max_bits)
             .clamp(TABLE_LOG_MIN, TABLE_LOG_MAX)
     }
 }
@@ -433,7 +424,9 @@ impl NormHistogram {
         writer.finish()
     }
 
-    /// Read in a normalized histogram that has been written out with [`write`][Self::write].
+    /// Read in a normalized histogram that has been written out with
+    /// [`write`][Self::write]. On success, returns the histogram and the
+    /// remaining byte slice.
     pub fn read(slice: &[u8]) -> Result<(Self, &[u8]), HistError> {
         let mut reader = BitStreamReader::new(slice, slice.len() * 8);
         let log2 = reader.read(4)? as u32 + TABLE_LOG_MIN;
@@ -549,8 +542,10 @@ mod tests {
 
         let mut enc = Vec::with_capacity(norm_hist.write_bound());
         norm_hist.write(&mut enc);
+        let test: &[u8] = b"I am a test";
+        enc.extend_from_slice(test);
         let (dec_hist, rem) = NormHistogram::read(&enc).unwrap();
-        assert!(rem.len() <= 1);
+        assert_eq!(rem, test);
         assert_eq!(norm_hist, dec_hist);
     }
 

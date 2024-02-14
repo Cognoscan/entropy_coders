@@ -1,8 +1,6 @@
-use core::num;
-
 use crate::bitstream::{BitStackReader, BitStackWriter};
 use crate::histogram::NormHistogram;
-use crate::TABLE_LOG_RANGE;
+use crate::{find_mask, TABLE_LOG_RANGE};
 
 // Stepping through by 5/8 * size + 3 will, thanks to the "3" part,
 // uniquely step through the entire table. There are marginally better
@@ -27,7 +25,6 @@ struct SymbolTransform {
 }
 
 impl FseEncodeTable {
-
     /// Construct a new FSE table from a provided normalized histogram.
     pub fn new(hist: &NormHistogram) -> Self {
         let size = 1 << hist.log2_sum();
@@ -83,10 +80,7 @@ impl FseEncodeTable {
         let mut position = 0;
         let table_mask = size - 1;
         let step = table_step(size);
-        for (i, &x) in hist
-            .table_iter()
-            .enumerate()
-        {
+        for (i, &x) in hist.table_iter().enumerate() {
             for _ in 0..x {
                 self.symbols[position] = i as u8;
                 position = (position + step) & table_mask;
@@ -111,10 +105,7 @@ impl FseEncodeTable {
         // Build Symbol Transformation Table
         self.symbol_tt.fill(SymbolTransform::default());
         let mut total = 0;
-        for (&x, tt) in hist
-            .table_iter()
-            .zip(self.symbol_tt.iter_mut())
-        {
+        for (&x, tt) in hist.table_iter().zip(self.symbol_tt.iter_mut()) {
             match x {
                 // We fill this anyway for potential future use with a max symbol cost estimator
                 0 => tt.bits = ((self.table_log + 1) << 16) - (1 << self.table_log),
@@ -179,6 +170,12 @@ impl<'a> FseEncode<'a> {
         let bits_out = (symbol_tt.bits + self.value) >> 16;
         writer.write_bits_raw_unmasked(self.value as usize, bits_out as usize);
         let idx = ((self.value >> bits_out) as i32 + symbol_tt.find_state) as usize;
+        println!(
+            "write byte {:02x}, using {} bits, put 0x{:04x} on the stream",
+            sym,
+            bits_out,
+            self.value as usize & find_mask(bits_out as usize)
+        );
         self.value = *self.table.table.get_unchecked(idx) as u32;
     }
 
@@ -209,7 +206,6 @@ struct DecodeTransform {
 }
 
 impl FseDecodeTable {
-
     /// Create a new FSE decoding table from a normalized histogram.
     pub fn new(hist: &NormHistogram) -> Self {
         let mut this = Self {
@@ -238,17 +234,18 @@ impl FseDecodeTable {
 
         // Load in the low-probability symbols
         let mut symbol_next = [0u16; 256];
-        let large_limit = 1u16 << (self.table_log-1);
-        let mut high_threshold = size-1;
+        let large_limit = 1u16 << (self.table_log - 1);
+        let mut high_threshold = size - 1;
         for (s, (&c, sym)) in hist.table_iter().zip(symbol_next.iter_mut()).enumerate() {
             if c <= -1 {
                 self.table[high_threshold].symbol = s as u8;
                 high_threshold -= 1;
                 *sym = 1;
-            }
-            else {
+            } else {
                 let c = c as u16; // Range is now 0-32768, so this should be fine.
-                if c >= large_limit { self.fast_mode = false; }
+                if c >= large_limit {
+                    self.fast_mode = false;
+                }
                 *sym = c;
             }
         }
@@ -261,7 +258,9 @@ impl FseDecodeTable {
             for _ in 0..c {
                 self.table[position].symbol = s as u8;
                 position = (position + step) & table_mask;
-                while position > high_threshold { position = (position + step) & table_mask; }
+                while position > high_threshold {
+                    position = (position + step) & table_mask;
+                }
             }
         }
 
@@ -282,15 +281,168 @@ impl FseDecodeTable {
 
 #[derive(Debug)]
 pub struct FseDecode<'a> {
-    value: u32,
-    table: &'a FseEncodeTable,
+    state: u16,
+    table: &'a FseDecodeTable,
 }
 
 impl<'a> FseDecode<'a> {
-
     /// Initialize a stream decoder, failing if there aren't enough bits in the reader.
-    pub fn new(table: &'a FseEncodeTable, reader: &mut BitStackReader) -> Option<Self> {
-        let value = reader.read(table.table_log as usize)? as u32;
-        Some(Self { value, table })
+    pub fn new(table: &'a FseDecodeTable, reader: &mut BitStackReader) -> Option<Self> {
+        let state = reader.read(table.table_log as usize)? as u16;
+        Some(Self { state, table })
+    }
+
+    fn state_lookup(&self) -> &DecodeTransform {
+        unsafe { self.table.table.get_unchecked(self.state as usize) }
+    }
+
+    /// Decode the next symbol without reloading the reader's internal buffer
+    ///
+    /// # Safety
+    /// Only do this if you're certain there will be enough bits left in the
+    /// internal buffer for future operations.
+    pub unsafe fn decode_symbol_no_reload(&mut self, reader: &mut BitStackReader) -> Option<u8> {
+        let state_info = self.state_lookup();
+        let low_bits = reader.read_no_reload(state_info.num_bits as usize)?;
+        let sym = state_info.symbol;
+        println!(
+            "Read byte {:02x}, take {} bits, got 0x{:04x} off the stream",
+            sym, state_info.num_bits, low_bits
+        );
+        self.state = state_info.new_state + (low_bits as u16);
+        Some(sym)
+    }
+
+    /// Decode the next symbol and pull more data from the reader.
+    pub fn decode_symbol(&mut self, reader: &mut BitStackReader) -> Option<u8> {
+        let sym = unsafe { self.decode_symbol_no_reload(reader)? };
+        reader.reload();
+        Some(sym)
+    }
+
+    /// Extract the final symbol from the current state and finish decoding.
+    pub fn finish(self) -> u8 {
+        self.state_lookup().symbol
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::Rng;
+
+    /// Run the compressor directly
+    pub fn fse_compress(src: &[u8], dst: &mut Vec<u8>) -> (NormHistogram, usize) {
+        let mut writer = BitStackWriter::new(dst);
+        let hist = NormHistogram::new(src);
+        let fse_table = FseEncodeTable::new(&hist);
+        let mut src_iter = src.chunks(2).rev();
+        let first = src_iter.next().unwrap();
+        let first_byte = first.last().unwrap();
+        let mut encode = FseEncode::new_first_symbol(&fse_table, *first_byte);
+        if first.len() > 1 {
+            encode.encode(&mut writer, *first.first().unwrap());
+        }
+        for n in src_iter {
+            unsafe {
+                let n1 = *n.get_unchecked(1);
+                let n0 = *n.get_unchecked(0);
+                encode.encode_raw(&mut writer, n1);
+                if usize::BITS < 64 {
+                    writer.flush();
+                }
+                encode.encode_raw(&mut writer, n0);
+            }
+            writer.flush();
+        }
+        encode.finish(&mut writer);
+        // Marker bit, so the decoder knows where the final bit in the stream is.
+        writer.write_bits(1, 1);
+        (hist, writer.finish())
+    }
+
+    // Run the decompressor directly
+    pub fn fse_decompress(hist: &NormHistogram, src: &[u8], dst: &mut Vec<u8>) -> Option<usize> {
+        let len = dst.len();
+        let mut reader = BitStackReader::new(src)?;
+        let fse_table = FseDecodeTable::new(hist);
+        let mut decode = FseDecode::new(&fse_table, &mut reader).unwrap();
+        while let Some(s) = decode.decode_symbol(&mut reader) {
+            dst.push(s);
+        }
+        dst.push(decode.finish());
+        Some(dst.len() - len)
+    }
+
+    fn gen_sequence(prob: f64, size: usize) -> Vec<u8> {
+        const LUT_SIZE: usize = 4096;
+        let mut lut = [0u8; 4096];
+        let prob = prob.clamp(0.005, 0.995);
+        let mut remaining = LUT_SIZE;
+        let mut idx = 0;
+        let mut s = 0u8;
+        while remaining > 0 {
+            let n = ((remaining as f64 * prob) as usize).max(1);
+            for _ in 0..n {
+                lut[idx] = s;
+                idx += 1;
+            }
+            s += 1;
+            remaining -= n;
+        }
+        let mut out = Vec::with_capacity(size);
+        let mut rng = rand::thread_rng();
+        for _ in 0..size {
+            let i: u16 = rng.gen();
+            out.push(lut[i as usize & (LUT_SIZE - 1)]);
+        }
+        out
+    }
+
+    #[test]
+    fn compress() {
+        let src = gen_sequence(0.2, 1 << 15);
+        let mut dst = Vec::with_capacity(src.len());
+        fse_compress(&src, &mut dst);
+    }
+
+    fn compact_byte_slice_string(slice: &[u8]) -> String {
+        use std::fmt::Write;
+        let mut s = String::with_capacity(2 + 3 * slice.len());
+        s.push('[');
+        for b in slice {
+            write!(s, "{:02x},", b).unwrap();
+        }
+        s.push(']');
+        s
+    }
+
+    #[test]
+    fn decompress() {
+        let src = gen_sequence(0.2, 1 << 15);
+        let mut dst = Vec::with_capacity(src.len() + 8);
+        let mut dec = Vec::with_capacity(src.len());
+        let (hist, _) = fse_compress(&src, &mut dst);
+        fse_decompress(&hist, &dst, &mut dec).expect("Failed to decompress");
+        if src != dec {
+            println!("src.len = {}, dec.len = {}", src.len(), dec.len());
+            println!(
+                "Start of src: {}",
+                compact_byte_slice_string(&src[..16.min(src.len())])
+            );
+            println!(
+                "Start of dec: {}",
+                compact_byte_slice_string(&dec[..16.min(dec.len())])
+            );
+            println!(
+                "End of src: {}",
+                compact_byte_slice_string(&src[src.len().saturating_sub(17)..])
+            );
+            println!(
+                "End of dec: {}",
+                compact_byte_slice_string(&dec[dec.len().saturating_sub(17)..])
+            );
+            panic!("Decoded data doesn't match up with encoded data")
+        }
     }
 }
