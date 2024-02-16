@@ -60,7 +60,7 @@ writer.finish();
 
 use crate::bitstream::{BitStackReader, BitStackWriter};
 use crate::histogram::NormHistogram;
-use crate::{find_mask, TABLE_LOG_RANGE};
+use crate::TABLE_LOG_RANGE;
 
 // Stepping through by 5/8 * size + 3 will, thanks to the "3" part,
 // uniquely step through the entire table. There are marginally better
