@@ -159,8 +159,7 @@ impl<'a> BitStackReader<'a> {
 
         // Update the pointer, clamping to the base of the slice
         let base_offset = unsafe { self.ptr.offset_from(self.reader.as_ptr()) };
-        self.ptr = if base_offset >= (HALF_BYTES as isize)
-        {
+        self.ptr = if base_offset >= (HALF_BYTES as isize) {
             unsafe { self.ptr.offset(-((will_read * HALF_BYTES) as isize)) }
         } else {
             // we have to decrement to reach the base pointer only if we're at the end

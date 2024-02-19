@@ -45,7 +45,10 @@ mod tests {
             total_bits, written_bits,
             "Writer didn't actually write as many bits as we told it to"
         );
-        println!("total_bits = {}, written_bits = {}", total_bits, written_bits);
+        println!(
+            "total_bits = {}, written_bits = {}",
+            total_bits, written_bits
+        );
         let total_bytes = (total_bits + cfg.mark as usize + 7) / 8;
         assert_eq!(
             encoded.len(),
@@ -107,10 +110,7 @@ mod tests {
     }
 
     fn stack_tests_offset(offset: usize) {
-        let cfg = EncodeCfg {
-            mark: true,
-            offset,
-        };
+        let cfg = EncodeCfg { mark: true, offset };
         let mut test_vec = Vec::new();
         for i in 0..(BITS * 5) {
             test_vec.push((i & 0x1, 1));
@@ -155,10 +155,14 @@ mod tests {
     }
 
     #[test]
-    fn stack_tests_0() { stack_tests_offset(0); }
+    fn stack_tests_0() {
+        stack_tests_offset(0);
+    }
 
     #[test]
-    fn stack_tests_1() { stack_tests_offset(1); }
+    fn stack_tests_1() {
+        stack_tests_offset(1);
+    }
 
     fn stream_tests_offset(offset: usize) {
         let cfg = EncodeCfg {
@@ -210,8 +214,12 @@ mod tests {
     }
 
     #[test]
-    fn stream_tests_0() { stream_tests_offset(0); }
+    fn stream_tests_0() {
+        stream_tests_offset(0);
+    }
 
     #[test]
-    fn stream_tests_1() { stream_tests_offset(1); }
+    fn stream_tests_1() {
+        stream_tests_offset(1);
+    }
 }

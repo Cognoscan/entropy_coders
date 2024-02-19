@@ -22,32 +22,36 @@ fn gen_sequence(prob: f64, size: usize) -> Vec<u8> {
     let mut rng = rand::thread_rng();
     for _ in 0..size {
         let i: u16 = rng.gen();
-        out.push(lut[i as usize & (LUT_SIZE-1)]);
+        out.push(lut[i as usize & (LUT_SIZE - 1)]);
     }
     out
 }
 
 fn time_benchmark(c: &mut Criterion) {
-    let len = 1<<15;
+    let len = 1 << 15;
     let src = gen_sequence(0.2, len);
-    let mut dst = Vec::with_capacity(src.len()*2);
+    let mut dst = Vec::with_capacity(src.len() * 2);
     let mut group = c.benchmark_group("throughput");
     group.throughput(Throughput::Bytes(len as u64));
-    group.bench_function("compress_20", |b| b.iter(|| {
-        dst.clear();
-        entropy_coders::fse_compress2(black_box(src.as_slice()), &mut dst)
-    }));
+    group.bench_function("compress_20", |b| {
+        b.iter(|| {
+            dst.clear();
+            entropy_coders::fse_compress2(black_box(src.as_slice()), &mut dst)
+        })
+    });
     dst.clear();
     entropy_coders::fse_compress2(src.as_slice(), &mut dst);
     let mut dec = Vec::with_capacity(src.len());
-    group.bench_function("decompress_20", |b| b.iter(|| {
-        dec.clear();
-        entropy_coders::fse_decompress2(black_box(dst.as_slice()), &mut dec)
-    }));
+    group.bench_function("decompress_20", |b| {
+        b.iter(|| {
+            dec.clear();
+            entropy_coders::fse_decompress2(black_box(dst.as_slice()), &mut dec)
+        })
+    });
     group.finish();
 }
 
-criterion_group!{
+criterion_group! {
     name = time_bench;
     config = Criterion::default();
     targets = time_benchmark

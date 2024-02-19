@@ -64,7 +64,6 @@ struct DeferByteVec<'a> {
 }
 
 impl<'a> DeferByteVec<'a> {
-
     /// Wrap a byte vector for quicker push operations.
     fn new(v: &'a mut Vec<u8>) -> Self {
         let spare = v.spare_capacity_mut().as_mut_ptr_range();

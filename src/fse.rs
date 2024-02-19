@@ -57,7 +57,6 @@ writer.finish();
 
 */
 
-
 use crate::bitstream::{BitStackReader, BitStackWriter};
 use crate::histogram::NormHistogram;
 use crate::TABLE_LOG_RANGE;

@@ -282,7 +282,6 @@ impl Histogram {
         let log2 = self.optimal_log2();
         self.normalize(log2)
     }
-
 }
 
 /// A normalized histogram. Uses the special value "-1" to indicate a
@@ -514,7 +513,9 @@ impl TryFrom<[i32; 256]> for NormHistogram {
         // Find the power of two for this raw table
         let sum = value.iter().map(|x| x.unsigned_abs() as u64).sum::<u64>();
         let log2 = sum.ilog2();
-        if (1<<log2) != sum { return Err(()); }
+        if (1 << log2) != sum {
+            return Err(());
+        }
 
         // Figure out the total table size
         let mut table_len = 0;

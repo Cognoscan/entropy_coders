@@ -25,8 +25,7 @@ impl<'a> BitStackWriter<'a> {
             let align = spare.end.align_offset(HALF_BYTES);
             if align != 0 {
                 spare.end.offset(align as isize - (HALF_BYTES as isize))
-            }
-            else {
+            } else {
                 spare.end
             }
         } as *const u8;
@@ -102,8 +101,7 @@ impl<'a> BitStackWriter<'a> {
                     let align = spare.end.align_offset(HALF_BYTES);
                     if align != 0 {
                         spare.end.offset(align as isize - (HALF_BYTES as isize))
-                    }
-                    else {
+                    } else {
                         spare.end
                     }
                 } as *const u8;
