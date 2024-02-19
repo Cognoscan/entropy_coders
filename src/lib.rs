@@ -56,6 +56,60 @@ fn find_mask(val: usize) -> usize {
     unsafe { *MASK.get_unchecked(val) }
 }
 
+/// A wrapped byte vector for quickly pushing individual bytes into it.
+struct DeferByteVec<'a> {
+    v: &'a mut Vec<u8>,
+    ptr: *mut u8,
+    end: *mut u8,
+}
+
+impl<'a> DeferByteVec<'a> {
+
+    /// Wrap a byte vector for quicker push operations.
+    fn new(v: &'a mut Vec<u8>) -> Self {
+        let spare = v.spare_capacity_mut().as_mut_ptr_range();
+        Self {
+            v,
+            ptr: spare.start as *mut u8,
+            end: spare.end as *mut u8,
+        }
+    }
+
+    /// Reserve additional space in the byte vector, as needed.
+    #[cold]
+    fn reserve(&mut self, additional: usize) {
+        unsafe {
+            self.v
+                .set_len(self.ptr.offset_from(self.v.as_ptr()) as usize);
+        }
+        self.v.reserve(additional);
+        let spare = self.v.spare_capacity_mut().as_mut_ptr_range();
+        self.ptr = spare.start as *mut u8;
+        self.end = spare.end as *mut u8;
+    }
+
+    /// Push an additional byte onto the byte vector
+    fn push(&mut self, val: u8) {
+        if self.ptr == self.end {
+            self.reserve(1);
+        }
+        unsafe {
+            self.ptr.write(val);
+            self.ptr = self.ptr.add(1);
+        }
+    }
+}
+
+impl<'a> Drop for DeferByteVec<'a> {
+    fn drop(&mut self) {
+        // Complete the update of the byte vector before we release it.
+        unsafe {
+            self.v
+                .set_len(self.ptr.offset_from(self.v.as_ptr()) as usize);
+        }
+    }
+}
+
 pub fn fse_compress(src: &[u8], dst: &mut Vec<u8>) -> (NormHistogram, usize) {
     // Construct the histogram and write it out
     let hist = NormHistogram::new(src);
@@ -137,66 +191,29 @@ pub fn fse_decompress(src: &[u8], dst: &mut Vec<u8>) -> Option<usize> {
     // Recover the histogram
     let (hist, src) = NormHistogram::read(src).ok()?;
     let mut reader = bitstream::BitStackReader::new(src)?;
+    let mut fast_dst = DeferByteVec::new(dst);
 
     // Decode the stream
     let fse_table = fse::DecodeTable::new(&hist);
     let mut decode = fse::Decoder::new(&fse_table, &mut reader).unwrap();
     while let Some(s) = decode.decode_symbol(&mut reader) {
-        dst.push(s);
+        fast_dst.push(s);
         if usize::BITS >= 64 {
             if let Some(s) = unsafe { decode.decode_symbol_no_reload(&mut reader) } {
-                dst.push(s);
+                fast_dst.push(s);
             } else {
                 break;
             }
         }
     }
-    dst.push(decode.finish());
+    fast_dst.push(decode.finish());
+    drop(fast_dst);
     Some(dst.len() - len)
 }
 
 // Run the decompressor on a stream compressed with `fse_compress2`, returning
 // how many bytes were added to the output stream.
 pub fn fse_decompress2(src: &[u8], dst: &mut Vec<u8>) -> Option<usize> {
-    struct DeferVec<'a> {
-        v: &'a mut Vec<u8>,
-        ptr: *mut u8,
-        end: *mut u8,
-    }
-
-    impl<'a> DeferVec<'a> {
-        fn new(v: &'a mut Vec<u8>) -> Self {
-            let spare = v.spare_capacity_mut().as_mut_ptr_range();
-            Self {
-                v,
-                ptr: spare.start as *mut u8,
-                end: spare.end as *mut u8,
-            }
-        }
-
-        #[cold]
-        unsafe fn reserve(&mut self, additional: usize) {
-            self.v
-                .set_len(self.ptr.offset_from(self.v.as_ptr()) as usize);
-            self.v.reserve(additional);
-            let spare = self.v.spare_capacity_mut().as_mut_ptr_range();
-            self.ptr = spare.start as *mut u8;
-            self.end = spare.end as *mut u8;
-        }
-
-        unsafe fn push(&mut self, val: u8) {
-            if self.ptr == self.end {
-                self.reserve(1);
-            }
-            self.ptr.write(val);
-            self.ptr = self.ptr.add(1);
-        }
-
-        unsafe fn finish(self) {
-            self.v
-                .set_len(self.ptr.offset_from(self.v.as_ptr()) as usize);
-        }
-    }
     let len = dst.len();
 
     // Recover the histogram
@@ -207,7 +224,7 @@ pub fn fse_decompress2(src: &[u8], dst: &mut Vec<u8>) -> Option<usize> {
     let fse_table = fse::DecodeTable::new(&hist);
     let mut decode0 = fse::Decoder::new(&fse_table, &mut reader).unwrap();
     let mut decode1 = fse::Decoder::new(&fse_table, &mut reader).unwrap();
-    let mut fast_dst = DeferVec::new(dst);
+    let mut fast_dst = DeferByteVec::new(dst);
     unsafe {
         while let Some(s) = decode0.decode_symbol_no_reload(&mut reader) {
             fast_dst.push(s);
@@ -219,15 +236,15 @@ pub fn fse_decompress2(src: &[u8], dst: &mut Vec<u8>) -> Option<usize> {
             } else {
                 fast_dst.push(decode1.finish());
                 fast_dst.push(decode0.finish());
-                fast_dst.finish();
+                drop(fast_dst);
                 return Some(dst.len() - len);
             }
         }
         fast_dst.push(decode0.finish());
         fast_dst.push(decode1.finish());
-        fast_dst.finish();
     }
 
+    drop(fast_dst);
     Some(dst.len() - len)
 }
 
@@ -263,11 +280,23 @@ mod tests {
 
     #[test]
     fn compress() {
-        let src = gen_sequence(0.2, 1 << 5);
+        let src = gen_sequence(0.2, 1 << 16);
         let mut dst = Vec::with_capacity(src.len());
         let mut dec = Vec::with_capacity(src.len());
         fse_compress(&src, &mut dst);
         fse_decompress(&dst, &mut dec);
+        if src != dec {
+            panic!("Source and decoded result are different");
+        }
+    }
+
+    #[test]
+    fn compress2() {
+        let src = gen_sequence(0.2, 1 << 16);
+        let mut dst = Vec::with_capacity(src.len());
+        let mut dec = Vec::with_capacity(src.len());
+        fse_compress2(&src, &mut dst);
+        fse_decompress2(&dst, &mut dec);
         if src != dec {
             panic!("Source and decoded result are different");
         }
